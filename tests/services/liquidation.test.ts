@@ -52,6 +52,9 @@ vi.mock('@percolatorct/sdk', () => ({
   CrankAction: { FeeSweep: 0, Liquidate: 1 },
   derivePythPushOraclePDA: vi.fn(() => [{ toBase58: () => 'Oracle11111111111111111111111111111111' }, 0]),
   IX_TAG: { TradeNoCpi: 1, TradeCpi: 2 },
+  // v17 additions — default false so legacy-path tests continue to work.
+  isV17Account: vi.fn(() => false),
+  parsePortfolioV17: vi.fn(),
 }));
 
 vi.mock('@percolatorct/shared', () => ({

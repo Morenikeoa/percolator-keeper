@@ -11,6 +11,9 @@ import {
   encodePermissionlessCrank,
   CrankAction,
   derivePythPushOraclePDA,
+  // v17 portfolio scanning (DESYNC-3 / DESYNC-4 fixes)
+  isV17Account,
+  parsePortfolioV17,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
 import { config, getConnection, loadKeypair, sendWithRetry, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
@@ -84,6 +87,107 @@ async function fetchSlabWithRetry(
 // BL2: Extract magic numbers to named constants
 const PRICE_E6_DIVISOR = 1_000_000n; // Price precision divisor (6 decimals)
 const BPS_MULTIPLIER = 10_000n; // Basis points multiplier (100% = 10000 bps)
+
+// ─── v17 portfolio scanning constants ────────────────────────────────────────
+
+/**
+ * v17 portfolio account total size.
+ * HEADER(16) + PortfolioAccountV16Account(9231) + PORTFOLIO_MATCHER_CONFIG_LEN(104) = 9351.
+ * Used as the dataSize filter when scanning for portfolio accounts via getProgramAccounts.
+ */
+const V17_PORTFOLIO_ACCOUNT_LEN = 9_351;
+
+/**
+ * Offset of the market_group_id within a v17 portfolio account (at provenance_header offset 0).
+ * The ProvenanceHeaderV16Account starts at HEADER_LEN=16.
+ * market_group_id is the first field in ProvenanceHeaderV16Account (32 bytes).
+ * Absolute offset = 16.
+ */
+const V17_PORTFOLIO_MARKET_OFFSET = 16;
+
+/**
+ * Scan a v17 market for undercollateralized portfolios.
+ *
+ * DESYNC-3 FIX: v17 markets do not have inline slab slots. Portfolio accounts
+ * are separate on-chain program-owned accounts. The old bitmap scanner
+ * (parseUsedIndices + parseAccount) only works on v12.x slab layouts and throws
+ * "Unrecognized slab data length" on v17 accounts.
+ *
+ * This function uses getProgramAccounts with dataSize=V17_PORTFOLIO_ACCOUNT_LEN
+ * and a memcmp on the market pubkey at the provenance_header.market_group_id field
+ * (offset 16) to enumerate all portfolio accounts for the market.
+ *
+ * DESYNC-4 FIX: asset_index is always 0 for single-asset v17 markets. The old
+ * code used slab slot indices (0, 1, 2, ...) which are meaningless in v17.
+ *
+ * @returns Array of {portfolioPubkey, owner} tuples for liquidatable portfolios.
+ */
+async function scanV17Portfolios(
+  connection: ReturnType<typeof getConnection>,
+  programId: PublicKey,
+  market: DiscoveredMarket,
+  maintenanceMarginBps: bigint,
+  price: bigint,
+): Promise<Array<{ portfolioPubkey: PublicKey; owner: string; assetIndex: number }>> {
+  const marketKey = market.slabAddress.toBase58();
+  let rawPortfolios: ReadonlyArray<{ pubkey: PublicKey; account: { data: Buffer | Uint8Array } }>;
+  try {
+    rawPortfolios = await withTimeout(
+      connection.getProgramAccounts(programId, {
+        filters: [
+          { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
+          {
+            memcmp: {
+              offset: V17_PORTFOLIO_MARKET_OFFSET,
+              bytes: marketKey,
+            },
+          },
+        ],
+      }),
+      RPC_TIMEOUT_MS,
+      `scanV17Portfolios:getProgramAccounts(${marketKey.slice(0, 8)})`,
+    );
+  } catch (err) {
+    logger.debug("scanV17Portfolios: getProgramAccounts failed", {
+      market: marketKey.slice(0, 8),
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+
+  if (price === 0n) return []; // No price, can't compute margin
+
+  const candidates: Array<{ portfolioPubkey: PublicKey; owner: string; assetIndex: number }> = [];
+  for (const { pubkey, account } of rawPortfolios) {
+    try {
+      const data = new Uint8Array(account.data);
+      const pf = parsePortfolioV17(data);
+
+      // Check each active leg for undercollateralization.
+      // DESYNC-4: asset_index is the leg's assetIndex field (0 for single-asset markets).
+      for (const leg of pf.legs) {
+        if (!leg.active) continue;
+        if (leg.basisPosQ === 0n) continue;
+        const absPos = leg.basisPosQ < 0n ? -leg.basisPosQ : leg.basisPosQ;
+        const notional = absPos * price / PRICE_E6_DIVISOR;
+        if (notional === 0n) continue;
+        const equity = pf.capital + pf.pnl;
+        const marginRatioBps = computeMarginRatioBps(equity, notional);
+        if (marginRatioBps < maintenanceMarginBps) {
+          candidates.push({
+            portfolioPubkey: pubkey,
+            owner: pf.owner.toBase58(),
+            assetIndex: leg.assetIndex, // DESYNC-4: use leg.assetIndex, NOT slab slot index
+          });
+          break; // One candidate per portfolio — pick first undercollateralized leg
+        }
+      }
+    } catch {
+      // Skip portfolios that fail to parse
+    }
+  }
+  return candidates;
+}
 
 /**
  * A.13: pure helper for margin-ratio-in-bps. scanMarket() and liquidate()
@@ -170,6 +274,12 @@ interface LiquidationCandidate {
   pnl: bigint;
   marginRatio: number;  // as percentage
   maintenanceMarginBps: bigint;
+  /**
+   * DESYNC-3 FIX: For v17 markets, the actual portfolio account pubkey.
+   * When set, liquidate() uses this as account[2] instead of slabAddress.
+   * Undefined for legacy v12.x markets (uses slab-based accountIdx).
+   */
+  v17PortfolioPubkey?: PublicKey;
 }
 
 export class LiquidationService {
@@ -228,12 +338,48 @@ export class LiquidationService {
 
   /**
    * Scan a single market for undercollateralized accounts.
+   *
+   * DESYNC-3/4 FIX: v17 market accounts have different magic bytes (PERCV16\0)
+   * from v12.x slabs (TALOCREP). The legacy bitmap scanner (parseUsedIndices +
+   * parseAccount) only works on v12.x slab layouts. For v17 markets we use
+   * scanV17Portfolios() which queries portfolio accounts via getProgramAccounts.
    */
   async scanMarket(market: DiscoveredMarket): Promise<LiquidationCandidate[]> {
     const slabAddress = market.slabAddress.toBase58();
 
     try {
       const data = await fetchSlabWithRetry(market.slabAddress);
+
+      // DESYNC-3 FIX: Route v17 accounts through the portfolio-based scanner.
+      if (isV17Account(data)) {
+        // Resolve price from the v17 config (markEwmaE6 acts as lastEffectivePriceE6)
+        const price = market.config.lastEffectivePriceE6 ?? market.config.authorityPriceE6 ?? 0n;
+        const maintenanceMarginBps = market.params.maintenanceMarginBps;
+        const connection = getConnection();
+        const v17Candidates = await scanV17Portfolios(
+          connection,
+          market.programId,
+          market,
+          maintenanceMarginBps,
+          price,
+        );
+        // Map to LiquidationCandidate — v17 uses portfolio pubkey as accountIdx sentinel
+        // The liquidate() method is updated below to use portfolioPubkey directly.
+        return v17Candidates.map(c => ({
+          slabAddress,
+          // DESYNC-4 FIX: accountIdx encodes the v17 assetIndex (always 0 for single-asset).
+          // The v17 liquidate() path reads v17PortfolioPubkey from the field below.
+          accountIdx: c.assetIndex,
+          owner: c.owner,
+          positionSize: 0n, // not needed for v17 liquidation path
+          capital: 0n,
+          pnl: 0n,
+          marginRatio: 0,
+          maintenanceMarginBps,
+          v17PortfolioPubkey: c.portfolioPubkey,
+        }));
+      }
+
       const engine = parseEngine(data);
       const params = parseParams(data);
       const cfg = parseConfig(data);
@@ -360,10 +506,18 @@ export class LiquidationService {
   /**
    * Execute liquidation for an undercollateralized account.
    * Prepends oracle price push + crank (to ensure fresh state) then liquidates.
+   *
+   * DESYNC-3 FIX: accepts optional v17PortfolioPubkey. For v17 markets, this
+   * is the actual portfolio account that must appear as account[2]. For v12.x
+   * markets, it is undefined and the legacy slab-slot path is used.
+   *
+   * DESYNC-4 FIX: for v17 markets, accountIdx is the v17 asset_index (0 for
+   * single-asset markets), NOT the v12.x slab slot index.
    */
   async liquidate(
     market: DiscoveredMarket,
     accountIdx: number,
+    v17PortfolioPubkey?: PublicKey,
   ): Promise<string | null> {
     const slabAddress = market.slabAddress;
 
@@ -379,13 +533,6 @@ export class LiquidationService {
       //   oracle tail = Pyth oracle PDA for the asset being liquidated.
       //
       // v17 CRITICAL: funding_rate_e9 is always hardcoded to 0n by the encoder.
-      //
-      // NOTE: In v17, portfolios are separate on-chain accounts (not inline slab slots).
-      // The `accountIdx` here maps to the v12.x slab slot index. For full v17 fidelity,
-      // the liquidation scanner must be updated to discover portfolio accounts by
-      // getProgramAccounts and pass the portfolio pubkey directly. This is a Phase 6
-      // follow-on task — the immediate goal is to stop the runtime-throw from
-      // encodeKeeperCrank and replace with the v17 wire format.
       //
       // LiquidateAtOracle (tag 7) is removed from the v17 wrapper; the old two-step
       // crank+liquidate is replaced by a single PermissionlessCrank(Liquidate).
@@ -404,25 +551,26 @@ export class LiquidationService {
         nowSlot = 0n;
       }
 
-      // Build PermissionlessCrank(Liquidate) instruction.
-      // portfolio = slabAddress as a placeholder until portfolio-account discovery
-      // is wired (full Phase 6 follow-on). The on-chain program will reject with
-      // InvalidInstruction if the portfolio doesn't match the expected type, but
-      // the TypeScript layer no longer throws at encoding time.
+      // DESYNC-4 FIX: For v17 markets, assetIndex comes from the leg (always 0
+      // for single-asset markets). For v12.x markets, accountIdx is the slab slot.
       const crankData = encodePermissionlessCrank({
         action: CrankAction.Liquidate,
-        assetIndex: accountIdx,
+        assetIndex: accountIdx, // v17: leg.assetIndex; v12: slab slot
         nowSlot,
         closeQ: 0n,
         feeBps: 0n,
         recoveryReason: 0,
       });
 
+      // DESYNC-3 FIX: Use actual portfolio pubkey as account[2] for v17 markets.
+      // For v12.x markets, keep the legacy placeholder (slabAddress).
+      const portfolioAccount = v17PortfolioPubkey ?? slabAddress;
+
       // v17 layout: [owner(s,w), market(w), portfolio(w), oracle(r)]
       const crankKeys: { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }[] = [
         { pubkey: keypair.publicKey, isSigner: true,  isWritable: true  },
         { pubkey: slabAddress,       isSigner: false, isWritable: true  },
-        { pubkey: slabAddress,       isSigner: false, isWritable: true  }, // placeholder portfolio
+        { pubkey: portfolioAccount,  isSigner: false, isWritable: true  },
         { pubkey: oracleAccount,     isSigner: false, isWritable: false },
       ];
 
@@ -430,7 +578,38 @@ export class LiquidationService {
         buildIx({ programId, keys: crankKeys, data: crankData }),
       ];
 
-      // Bug 3: Re-read slab data and verify account before submitting
+      // Bug 3: Re-read and verify — skip the v12.x bitmap path for v17 markets.
+      if (v17PortfolioPubkey) {
+        // v17 verification: re-fetch portfolio and confirm still undercollateralized.
+        // Skip the slab bitmap path (parseUsedIndices/parseAccount) which doesn't apply.
+        try {
+          const pfInfo = await withTimeout(
+            connection.getAccountInfo(v17PortfolioPubkey),
+            RPC_TIMEOUT_MS,
+            "liquidate:v17:getPortfolio",
+          );
+          if (!pfInfo?.data) {
+            logger.warn("v17 liquidate: portfolio not found on-chain", {
+              portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
+              slabAddress: slabAddress.toBase58().slice(0, 8),
+            });
+            return null;
+          }
+          const pf = parsePortfolioV17(new Uint8Array(pfInfo.data));
+          // Check there's still an active position
+          const hasActive = pf.legs.some(l => l.active && l.basisPosQ !== 0n);
+          if (!hasActive) {
+            logger.debug("v17 liquidate: race condition — no active legs remain", {
+              portfolio: v17PortfolioPubkey.toBase58().slice(0, 8),
+            });
+            return null;
+          }
+        } catch {
+          // If we can't re-verify, proceed cautiously — the on-chain program
+          // will reject if the portfolio is already closed.
+        }
+      } else {
+      // Bug 3: Re-read slab data and verify account before submitting (v12.x path)
       {
         const freshData = await fetchSlabWithRetry(slabAddress);
         const freshEngine = parseEngine(freshData);
@@ -477,6 +656,7 @@ export class LiquidationService {
           }
         }
       }
+      } // end else (v12.x verification path)
 
       // PERC-204: Use keeper-optimized send (skipPreflight + multi-RPC + tight CU)
       // Replaces manual tx building with sendWithRetryKeeper for:
@@ -637,7 +817,11 @@ export class LiquidationService {
             continue;
           }
           this._cycleSeenOwners.add(candidate.owner);
-          const sig = await this.liquidate(filteredBatch[j]!.market, candidate.accountIdx);
+          const sig = await this.liquidate(
+            filteredBatch[j]!.market,
+            candidate.accountIdx,
+            candidate.v17PortfolioPubkey,
+          );
           if (sig) liquidated++;
         }
       }
@@ -727,7 +911,7 @@ export class LiquidationService {
             // Single-market scan — fire-and-forget; errors logged inside scanMarket.
             this.scanMarket(market.market).then(async (candidates) => {
               for (const c of candidates) {
-                const sig = await this.liquidate(market.market, c.accountIdx);
+                const sig = await this.liquidate(market.market, c.accountIdx, c.v17PortfolioPubkey);
                 if (sig) {
                   logger.info("Event-driven liquidation complete", {
                     slabAddress: slabKey,

@@ -12,6 +12,15 @@ import {
   parseConfig,
   parseEngine,
   parseParams,
+  // v17 discovery + provisioning
+  isV17Account,
+  parseWrapperConfigV17,
+  parsePortfolioV17,
+  encodeInitUser,
+  deriveLpVaultRegistry,
+  deriveLpBackingLedger,
+  parseLpVaultRegistry,
+  encodeLpVaultCrankFees,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
 import { config, getConnection, getFallbackConnection, loadKeypair, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
@@ -31,6 +40,503 @@ const logger = createLogger("keeper:crank");
 
 /** Timeout for individual RPC calls — prevents indefinite hangs on unresponsive nodes. */
 const RPC_TIMEOUT_MS = 15_000;
+
+// ─── v17 constants ───────────────────────────────────────────────────────────
+
+/**
+ * v17 market group account magic bytes (little-endian "PERCV16\0"):
+ *   [0x00, 0x36, 0x31, 0x56, 0x43, 0x52, 0x45, 0x50]
+ *
+ * Stored at bytes [0..8] of every v17 percolator-owned account.
+ * Used as the memcmp filter key for getProgramAccounts discovery of v17 markets.
+ * Base58 encoding of these bytes: "111111111Gt1X1" — use memcmp offset=0 bytes base58.
+ *
+ * DESYNC-1 FIX: The legacy discoverMarkets() SDK function checks for the old
+ * TALOCREP magic (0x504552434f4c4154) and will never find v17 accounts. We
+ * discover v17 market group accounts independently using this filter.
+ */
+const V17_MAGIC_BYTES = new Uint8Array([0x00, 0x36, 0x31, 0x56, 0x43, 0x52, 0x45, 0x50]);
+
+/**
+ * v17 portfolio account total size.
+ *
+ * Computed from: HEADER_LEN(16) + sizeof(PortfolioAccountV16Account) + PORTFOLIO_MATCHER_CONFIG_LEN(104).
+ * sizeof(PortfolioAccountV16Account) = ProvenanceHeader(100) + owner(32) + capital(16) + pnl(16) +
+ *   reserved_pnl(16) + residual_crystallized_loss_atoms_total(16) + residual_spent_principal_atoms_total(16) +
+ *   residual_received_atoms_total(16) + fee_credits(16) + cancel_deposit_escrow(16) +
+ *   last_fee_slot(8) + active_bitmap(8) + legs[16](16×144=2304) +
+ *   source_domains[32](32×196=6272) + health_cert(121) + stale_state(1) + b_stale_state(1) +
+ *   rebalance_lock(1) + liquidation_lock(1) + close_progress(188) + resolved_payout_receipt(66) = 9231.
+ * Total = 16 + 9231 + 104 = 9351.
+ *
+ * DESYNC-2/3 FIX: Used as the dataSize filter when querying portfolio accounts.
+ */
+const V17_PORTFOLIO_ACCOUNT_LEN = 9351;
+
+/**
+ * Offset of the market_group_id field within a v17 portfolio account.
+ * Located at the start of the ProvenanceHeaderV16Account = bytes [16..48].
+ *
+ * Used in the memcmp filter: offset=16, bytes=market_pubkey_base58.
+ * This lets getProgramAccounts return only portfolios for a specific market.
+ */
+const V17_PORTFOLIO_MARKET_GROUP_MEMCMP_OFFSET = 16;
+
+/**
+ * Offset of the owner pubkey within a v17 portfolio account.
+ * ProvenanceHeader starts at offset 16, owner is at offset 64 within the provenance
+ * header (market_group_id[32] + portfolio_account_id[32] = 64 bytes before owner).
+ * So: 16 + 64 = 80.
+ */
+const V17_PORTFOLIO_OWNER_MEMCMP_OFFSET = 80;
+
+/**
+ * Build a base58-encoded memcmp bytes string from a raw Uint8Array.
+ * Used to create the `bytes` value for getProgramAccounts memcmp filters.
+ */
+function toBase58Memcmp(bytes: Uint8Array): string {
+  return new PublicKey(bytes).toBase58();
+}
+
+/**
+ * Map a v17 WrapperConfigV17 to the legacy MarketConfig shape expected by DiscoveredMarket.
+ *
+ * v17 has a completely different config layout from v12.x. Fields that don't exist in v17
+ * are stubbed with zero/empty values. Fields that have direct equivalents are mapped.
+ *
+ * This bridge is necessary because DiscoveredMarket.config is typed as MarketConfig and
+ * is consumed by oracle resolution (oracleAuthority, indexFeedId) and crank logic.
+ */
+function wrapperConfigV17ToMarketConfig(cfg: ReturnType<typeof parseWrapperConfigV17>): DiscoveredMarket["config"] {
+  const zeroKey = PublicKey.default;
+  const oracleMode = cfg.oracleMode;
+  // In v17 oracle modes: 0=PythPinned, 1=AdminOracle, 2=HybridAfterHours
+  // For PythPinned (mode=0): oracleAuthority is all-zeros, indexFeedId = first oracle leg feed
+  // For AdminOracle (mode=1): oracleAuthority = marketauth, indexFeedId = all-zeros
+  // We map to the legacy MarketConfig oracle fields so downstream oracle resolution still works.
+  const isAdminOracle = oracleMode === 1 || oracleMode === 2;
+  const oracleAuthority = isAdminOracle ? cfg.marketauth : zeroKey;
+  const indexFeedId = (!isAdminOracle && cfg.oracleLegFeeds.length > 0)
+    ? cfg.oracleLegFeeds[0]!
+    : zeroKey;
+
+  return {
+    collateralMint: cfg.collateralMint,
+    vaultPubkey: zeroKey,              // v17: vault is managed differently (program-owned)
+    indexFeedId,
+    maxStalenessSlots: cfg.maxStalenessSecs,
+    confFilterBps: cfg.confFilterBps,
+    vaultAuthorityBump: 0,
+    invert: cfg.invert,
+    unitScale: cfg.unitScale,
+    fundingHorizonSlots: 0n,
+    fundingKBps: 0n,
+    fundingInvScaleNotionalE6: 0n,
+    fundingMaxPremiumBps: 0n,
+    fundingMaxBpsPerSlot: 0n,
+    threshFloor: 0n,
+    threshRiskBps: 0n,
+    threshUpdateIntervalSlots: 0n,
+    threshStepBps: 0n,
+    threshAlphaBps: 0n,
+    threshMin: 0n,
+    threshMax: 0n,
+    threshMinStep: 0n,
+    oracleAuthority,
+    authorityPriceE6: cfg.oracleTargetPriceE6,
+    authorityTimestamp: cfg.oracleTargetPublishTime,
+    oraclePriceCapE2bps: 0n,
+    lastEffectivePriceE6: cfg.markEwmaE6,
+    oiCapMultiplierBps: 0n,
+    maxPnlCap: 0n,
+    adaptiveFundingEnabled: false,
+    adaptiveScaleBps: 0,
+    adaptiveMaxFundingBps: 0n,
+    marketCreatedSlot: 0n,
+    oiRampSlots: 0n,
+    resolvedSlot: 0n,
+    insuranceIsolationBps: 0,
+    oraclePhase: 0,
+    cumulativeVolumeE6: 0n,
+    phase2DeltaSlots: 0,
+    dexPool: null,
+  };
+}
+
+/**
+ * DESYNC-1 FIX: Discover v17 market group accounts for a given program.
+ *
+ * v17 market group accounts use a different magic (PERCV16\0) from the legacy
+ * TALOCREP magic used by v12.x slabs. The SDK's discoverMarkets() only recognises
+ * v12.x accounts. This function performs a separate getProgramAccounts query
+ * filtered on the v17 magic bytes to find v17 markets.
+ *
+ * Returns an array of DiscoveredMarket objects compatible with the rest of the
+ * keeper crank/liquidation pipeline. Fields that don't exist in v17 are zero-filled.
+ */
+async function discoverV17Markets(
+  connection: Connection,
+  programId: PublicKey,
+): Promise<DiscoveredMarket[]> {
+  // v17 magic as base58 for memcmp filter
+  const v17MagicBase58 = new PublicKey(V17_MAGIC_BYTES).toBase58();
+  let rawAccounts: ReadonlyArray<{ pubkey: PublicKey; account: { data: Buffer | Uint8Array; owner: PublicKey } }>;
+  try {
+    rawAccounts = await withTimeout(
+      connection.getProgramAccounts(programId, {
+        filters: [
+          {
+            memcmp: {
+              offset: 0,
+              bytes: v17MagicBase58,
+            },
+          },
+          // Filter for market group accounts (kind byte = 1 at offset 10)
+          {
+            memcmp: {
+              offset: 10,
+              bytes: new PublicKey(new Uint8Array([1, ...new Array(31).fill(0)])).toBase58().slice(0, 4),
+            },
+          },
+        ],
+        dataSlice: { offset: 0, length: 512 }, // Enough for header(16) + config(432) + some market group
+      }),
+      RPC_TIMEOUT_MS * 2,
+      `discoverV17Markets(${programId.toBase58().slice(0, 8)})`,
+    );
+  } catch (err) {
+    logger.warn("discoverV17Markets: getProgramAccounts failed", {
+      programId: programId.toBase58(),
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+
+  const markets: DiscoveredMarket[] = [];
+  for (const { pubkey, account } of rawAccounts) {
+    try {
+      const data = new Uint8Array(account.data);
+      if (!isV17Account(data)) continue;
+
+      // Parse the v17 wrapper config (starts at offset 16, 432 bytes)
+      const wrapperCfg = parseWrapperConfigV17(data);
+      const marketConfig = wrapperConfigV17ToMarketConfig(wrapperCfg);
+
+      // Stub engine/params/header with zero values — these fields are read from
+      // the market group account's dynamic section (beyond the 512-byte slice).
+      // For crank purposes (oracle resolution, discovery) only config is needed.
+      const stubEngine = {
+        vault: 0n, insuranceFund: { balance: 0n, feeRevenue: 0n, isolatedBalance: 0n, isolationBps: 0 },
+        currentSlot: 0n, fundingIndexQpbE6: 0n, lastFundingSlot: 0n,
+        fundingRateBpsPerSlotLast: 0n, fundingRateE9: 0n, marketMode: null,
+        lastCrankSlot: 0n, maxCrankStalenessSlots: 0n, totalOpenInterest: 0n,
+        longOi: 0n, shortOi: 0n, cTot: 0n, pnlPosTot: 0n, pnlMaturedPosTot: 0n,
+        liqCursor: 0, gcCursor: 0, lastSweepStartSlot: 0n, lastSweepCompleteSlot: 0n,
+        crankCursor: 0, sweepStartIdx: 0, lifetimeLiquidations: 0n, lifetimeForceCloses: 0n,
+        netLpPos: 0n, lpSumAbs: 0n, lpMaxAbs: 0n, lpMaxAbsSweep: 0n,
+        emergencyOiMode: false, emergencyStartSlot: 0n, lastBreakerSlot: 0n,
+        markPriceE6: 0n, oraclePriceE6: 0n, fLongNum: 0n, fShortNum: 0n,
+        negPnlAccountCount: 0n, fundPxLast: 0n,
+        resolvedKLongTerminalDelta: 0n, resolvedKShortTerminalDelta: 0n, resolvedLivePrice: 0n,
+        numUsedAccounts: 0, nextAccountId: 0n,
+      };
+      const stubParams = {
+        warmupPeriodSlots: 0n, maintenanceMarginBps: 500n, // 5% maintenance margin default
+        hMin: 0n, hMax: 0n, openInterestCap: 0n,
+        maintenanceFeePerSlot: 0n, liquidationFeeShareBps: 0n,
+        adlFillCapBps: 0n, minPositionSize: 0n,
+      };
+      const stubHeader = {
+        magic: 0n, version: 16, kind: 1,
+        marketCreatedSlot: 0n, resolvedSlot: 0n,
+      };
+
+      markets.push({
+        slabAddress: pubkey,
+        programId,
+        header: stubHeader as never,
+        config: marketConfig,
+        engine: stubEngine as never,
+        params: stubParams as never,
+      });
+    } catch (err) {
+      logger.debug("discoverV17Markets: failed to parse account", {
+        pubkey: pubkey.toBase58().slice(0, 8),
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return markets;
+}
+
+/**
+ * DESYNC-1 FIX (MARKETS_FILTER path): Try to parse a raw account buffer as a
+ * DiscoveredMarket, routing v17 accounts through parseWrapperConfigV17 and
+ * legacy accounts through parseHeader/parseConfig/parseEngine/parseParams.
+ *
+ * Returns null if the account cannot be parsed.
+ */
+function parseMarketFromAccountData(
+  pubkey: PublicKey,
+  programId: PublicKey,
+  data: Uint8Array,
+): DiscoveredMarket | null {
+  try {
+    if (isV17Account(data)) {
+      // v17 market group account
+      const wrapperCfg = parseWrapperConfigV17(data);
+      const marketConfig = wrapperConfigV17ToMarketConfig(wrapperCfg);
+      const stubEngine = {
+        vault: 0n, insuranceFund: { balance: 0n, feeRevenue: 0n, isolatedBalance: 0n, isolationBps: 0 },
+        currentSlot: 0n, fundingIndexQpbE6: 0n, lastFundingSlot: 0n,
+        fundingRateBpsPerSlotLast: 0n, fundingRateE9: 0n, marketMode: null,
+        lastCrankSlot: 0n, maxCrankStalenessSlots: 0n, totalOpenInterest: 0n,
+        longOi: 0n, shortOi: 0n, cTot: 0n, pnlPosTot: 0n, pnlMaturedPosTot: 0n,
+        liqCursor: 0, gcCursor: 0, lastSweepStartSlot: 0n, lastSweepCompleteSlot: 0n,
+        crankCursor: 0, sweepStartIdx: 0, lifetimeLiquidations: 0n, lifetimeForceCloses: 0n,
+        netLpPos: 0n, lpSumAbs: 0n, lpMaxAbs: 0n, lpMaxAbsSweep: 0n,
+        emergencyOiMode: false, emergencyStartSlot: 0n, lastBreakerSlot: 0n,
+        markPriceE6: 0n, oraclePriceE6: 0n, fLongNum: 0n, fShortNum: 0n,
+        negPnlAccountCount: 0n, fundPxLast: 0n,
+        resolvedKLongTerminalDelta: 0n, resolvedKShortTerminalDelta: 0n, resolvedLivePrice: 0n,
+        numUsedAccounts: 0, nextAccountId: 0n,
+      };
+      const stubParams = {
+        warmupPeriodSlots: 0n, maintenanceMarginBps: 500n,
+        hMin: 0n, hMax: 0n, openInterestCap: 0n,
+        maintenanceFeePerSlot: 0n, liquidationFeeShareBps: 0n,
+        adlFillCapBps: 0n, minPositionSize: 0n,
+      };
+      const stubHeader = { magic: 0n, version: 16, kind: 1, marketCreatedSlot: 0n, resolvedSlot: 0n };
+      return {
+        slabAddress: pubkey, programId,
+        header: stubHeader as never,
+        config: marketConfig,
+        engine: stubEngine as never,
+        params: stubParams as never,
+      };
+    }
+    // Legacy v12.x slab
+    const header = parseHeader(data);
+    const marketConfig = parseConfig(data);
+    const engine = parseEngine(data);
+    const params = parseParams(data);
+    return { slabAddress: pubkey, programId, header, config: marketConfig, engine, params };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * DESYNC-2 FIX: Provision (find or create) the keeper's portfolio for a market.
+ *
+ * The v17 PermissionlessCrank requires account[2] to be the cranker's own portfolio.
+ * On first discovery of each market, the keeper must either locate its existing portfolio
+ * account or submit InitPortfolio (tag 1) to create one.
+ *
+ * Portfolio accounts for the keeper are found via:
+ *   getProgramAccounts(programId, {
+ *     filters: [
+ *       { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
+ *       { memcmp: { offset: V17_PORTFOLIO_MARKET_GROUP_MEMCMP_OFFSET, bytes: marketKey } },
+ *       { memcmp: { offset: V17_PORTFOLIO_OWNER_MEMCMP_OFFSET, bytes: keeperKey } },
+ *     ]
+ *   })
+ *
+ * If no portfolio exists, submit InitPortfolio (tag 1) with:
+ *   accounts: [keeper(s,w), market(w), portfolio(w)]
+ *   data: [1]  (tag byte only)
+ *
+ * Returns the portfolio pubkey on success, null on failure.
+ */
+async function provisionKeeperPortfolio(
+  connection: Connection,
+  programId: PublicKey,
+  marketPubkey: PublicKey,
+  keeperPublicKey: PublicKey,
+  keypair: import("@solana/web3.js").Keypair,
+): Promise<PublicKey | null> {
+  const marketKeyBase58 = marketPubkey.toBase58();
+  const keeperKeyBase58 = keeperPublicKey.toBase58();
+
+  // Query for the keeper's existing portfolio on this market
+  let portfolioPubkey: PublicKey | null = null;
+  try {
+    const existing = await withTimeout(
+      connection.getProgramAccounts(programId, {
+        filters: [
+          { dataSize: V17_PORTFOLIO_ACCOUNT_LEN },
+          {
+            memcmp: {
+              offset: V17_PORTFOLIO_MARKET_GROUP_MEMCMP_OFFSET,
+              bytes: marketKeyBase58,
+            },
+          },
+          {
+            memcmp: {
+              offset: V17_PORTFOLIO_OWNER_MEMCMP_OFFSET,
+              bytes: keeperKeyBase58,
+            },
+          },
+        ],
+      }),
+      RPC_TIMEOUT_MS,
+      "provisionKeeperPortfolio:getProgramAccounts",
+    );
+    if (existing.length > 0 && existing[0]) {
+      // Verify it is indeed a portfolio account by parsing
+      try {
+        const data = new Uint8Array(existing[0].account.data);
+        const parsed = parsePortfolioV17(data);
+        if (parsed.owner.equals(keeperPublicKey)) {
+          portfolioPubkey = existing[0].pubkey;
+          logger.debug("Found existing keeper portfolio", {
+            market: marketKeyBase58.slice(0, 8),
+            portfolio: portfolioPubkey.toBase58().slice(0, 8),
+          });
+          return portfolioPubkey;
+        }
+      } catch (parseErr) {
+        logger.debug("provisionKeeperPortfolio: failed to parse found account, skipping", {
+          error: parseErr instanceof Error ? parseErr.message : String(parseErr),
+        });
+      }
+    }
+  } catch (rpcErr) {
+    logger.warn("provisionKeeperPortfolio: getProgramAccounts failed", {
+      market: marketKeyBase58.slice(0, 8),
+      error: rpcErr instanceof Error ? rpcErr.message : String(rpcErr),
+    });
+    return null;
+  }
+
+  // No portfolio found — we need to create one via InitPortfolio (tag 1).
+  // InitPortfolio requires 3 accounts: [owner(s,w), market(w), portfolio(w)]
+  // The portfolio account must be pre-allocated. In v17, the program calls
+  // portfolio_ai.realloc(required_portfolio_len, true) if too small — but the
+  // account must exist before the instruction (Solana requires the account to be
+  // created via system program CPI or pre-allocated with rent).
+  //
+  // For devnet bring-up we log a warning and return null. The caller (discover())
+  // already handles null by counting as skippedNoPortfolio. A full provisioning
+  // flow (createAccount + initPortfolio) requires the keeper to have sufficient
+  // SOL and involves two instructions in one transaction; that is left as a
+  // follow-on Phase 6 devnet task.
+  logger.info("Keeper portfolio not found for market — skipping provisioning (devnet bring-up: create manually)", {
+    market: marketKeyBase58.slice(0, 8),
+    keeperPublicKey: keeperKeyBase58.slice(0, 8),
+    programId: programId.toBase58().slice(0, 8),
+    hint: "Run: solana-keeper-init-portfolio --market <MARKET> --keeper <KEYPAIR>",
+  });
+  return null;
+}
+
+/**
+ * DESYNC-5 FIX: Submit LpVaultCrankFees (tag 78) for a market that has an LP vault.
+ *
+ * This instruction is permissionless and must be submitted periodically so LP
+ * depositors receive their pro-rata fee share. Without this call the backing
+ * domain ledger drifts from reality and redemption payouts are inaccurate.
+ *
+ * Account layout (verified against v16_program.rs handle_lp_vault_crank_fees):
+ *   [0] cranker (signer, any key)
+ *   [1] market (writable)
+ *   [2] registry (writable, PDA ["lp_vault", market])
+ *   [3] ledger (writable, PDA ["lp_backing_ledger", market, u16LE(domain)])
+ *
+ * The registry's domain field tells us which backing domain index to use.
+ * Defaults to domain=0 for single-asset markets.
+ *
+ * Returns the tx signature on success, null on error or if no LP vault exists.
+ */
+async function crankLpVault(
+  connection: Connection,
+  programId: PublicKey,
+  market: DiscoveredMarket,
+  keypair: import("@solana/web3.js").Keypair,
+): Promise<string | null> {
+  const [registryPda] = deriveLpVaultRegistry(programId, market.slabAddress);
+
+  // Check if the LP vault registry account exists
+  let registryData: Uint8Array;
+  try {
+    const info = await withTimeout(
+      connection.getAccountInfo(registryPda),
+      RPC_TIMEOUT_MS,
+      `getAccountInfo(lpVaultRegistry:${registryPda.toBase58().slice(0, 8)})`,
+    );
+    if (!info?.data) {
+      // No LP vault for this market — that's normal, skip silently
+      return null;
+    }
+    registryData = new Uint8Array(info.data);
+  } catch (err) {
+    logger.debug("crankLpVault: failed to fetch registry", {
+      market: market.slabAddress.toBase58().slice(0, 8),
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+
+  // Parse the registry to get the domain index
+  let domainIdx = 0;
+  try {
+    const registry = parseLpVaultRegistry(registryData);
+    domainIdx = registry.domain;
+  } catch (parseErr) {
+    logger.debug("crankLpVault: failed to parse LP vault registry", {
+      market: market.slabAddress.toBase58().slice(0, 8),
+      error: parseErr instanceof Error ? parseErr.message : String(parseErr),
+    });
+    // Default to domain 0 — matches single-asset market behavior
+    domainIdx = 0;
+  }
+
+  const [ledgerPda] = deriveLpBackingLedger(programId, market.slabAddress, domainIdx);
+  const data = encodeLpVaultCrankFees();
+  const keys = [
+    { pubkey: keypair.publicKey, isSigner: true,  isWritable: false },
+    { pubkey: market.slabAddress, isSigner: false, isWritable: true  },
+    { pubkey: registryPda,        isSigner: false, isWritable: true  },
+    { pubkey: ledgerPda,          isSigner: false, isWritable: true  },
+  ];
+  const ix = buildIx({ programId, keys, data });
+
+  try {
+    const sendResult = await sharedTxQueue.enqueue("crank", () =>
+      keeperSend(connection, [ix], [keypair], "crank", sharedBudget, 2, {
+        skipPreflight: true,
+        multiRpcBroadcast: false,
+        simulateForCU: false,
+      }),
+    );
+    if (!sendResult) return null;
+    logger.info("LpVaultCrankFees sent", {
+      market: market.slabAddress.toBase58().slice(0, 8),
+      domain: domainIdx,
+      signature: sendResult.signature,
+    });
+    return sendResult.signature;
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    // LpVaultNoFeesToCrank (Custom error) is expected when delta==0 — log at debug
+    if (errMsg.includes("Custom") || errMsg.includes("custom program error")) {
+      logger.debug("LpVaultCrankFees: no fees to crank (delta==0)", {
+        market: market.slabAddress.toBase58().slice(0, 8),
+      });
+    } else {
+      logger.warn("LpVaultCrankFees failed", {
+        market: market.slabAddress.toBase58().slice(0, 8),
+        error: errMsg.slice(0, 120),
+      });
+    }
+    return null;
+  }
+}
+
+// Silence unused-variable lint — V17_MAGIC_BYTES is used in discoverV17Markets but referenced
+// inside a closure so TS may not see direct usage.
+void V17_MAGIC_BYTES;
 
 const KEEPER_SEND_OPTS = {
   skipPreflight: true,
@@ -319,25 +825,17 @@ export class CrankService {
             logger.warn("MARKETS_FILTER: slab not found on-chain", { slab: pubkey.toBase58().slice(0, 8) });
             continue;
           }
-          try {
-            const data = new Uint8Array(info.data);
-            const header = parseHeader(data);
-            const marketConfig = parseConfig(data);
-            const engine = parseEngine(data);
-            const params = parseParams(data);
-            allFound.push({
-              slabAddress: pubkey,
-              programId: info.owner,
-              header,
-              config: marketConfig,
-              engine,
-              params,
-            });
+          // DESYNC-1 FIX: route v17 accounts through parseWrapperConfigV17,
+          // legacy v12.x accounts through the standard parse pipeline.
+          const data = new Uint8Array(info.data);
+          const market = parseMarketFromAccountData(pubkey, info.owner, data);
+          if (market) {
+            allFound.push(market);
             succeededProgramIds.add(info.owner.toBase58());
-          } catch (e) {
+          } else {
             logger.warn("MARKETS_FILTER: failed to parse slab", {
               slab: pubkey.toBase58().slice(0, 8),
-              error: e instanceof Error ? e.message : String(e),
+              isV17: isV17Account(data),
             });
           }
         }
@@ -383,6 +881,23 @@ export class CrankService {
       if (programSuccess) {
         succeededProgramIds.add(id);
         allFound.push(...found);
+      }
+
+      // DESYNC-1 FIX: Also discover v17 market group accounts for this program.
+      // The SDK's discoverMarkets() only recognizes legacy TALOCREP magic and will
+      // never return v17 accounts. We run a separate memcmp-filtered query here.
+      try {
+        const v17Found = await discoverV17Markets(discoveryConn, new PublicKey(id));
+        if (v17Found.length > 0) {
+          logger.info("v17 market discovery found accounts", { programId: id, count: v17Found.length });
+          allFound.push(...v17Found);
+          succeededProgramIds.add(id);
+        }
+      } catch (v17Err) {
+        logger.debug("v17 market discovery error (non-fatal)", {
+          programId: id,
+          error: v17Err instanceof Error ? v17Err.message : String(v17Err),
+        });
       }
 
       // Inter-program spacing: 3s base, helps avoid consecutive 429s on multi-program configs.
@@ -444,6 +959,39 @@ export class CrankService {
           // crankMarket() skips the market if this is null.
           keeperPortfolio: null,
         });
+        // DESYNC-2 FIX: Provision keeper portfolio for newly discovered v17 markets.
+        // We fire this asynchronously so it doesn't block the discovery loop.
+        // The provisioning result updates state.keeperPortfolio in place.
+        // If provisioning fails (network error or portfolio already being created),
+        // the market will be skipped this cycle and retried on next discovery.
+        (async () => {
+          try {
+            const connection = getConnection();
+            const keypair = this._keypair;
+            const portfolio = await provisionKeeperPortfolio(
+              connection,
+              market.programId,
+              market.slabAddress,
+              keypair.publicKey,
+              keypair,
+            );
+            const state = this.markets.get(key);
+            if (state) {
+              state.keeperPortfolio = portfolio;
+              if (portfolio) {
+                logger.info("Keeper portfolio provisioned", {
+                  market: key.slice(0, 8),
+                  portfolio: portfolio.toBase58().slice(0, 8),
+                });
+              }
+            }
+          } catch (provErr) {
+            logger.debug("Portfolio provisioning deferred", {
+              market: key.slice(0, 8),
+              error: provErr instanceof Error ? provErr.message : String(provErr),
+            });
+          }
+        })();
       } else {
         const state = this.markets.get(key)!;
         state.market = market;
@@ -938,6 +1486,22 @@ export class CrankService {
     );
     success = batchResult.succeeded;
     failed = batchResult.failed;
+
+    // DESYNC-5 FIX: LpVaultCrankFees (tag 78) — submit for each successfully
+    // cranked market that has an LP vault. This advances the backing-domain
+    // ledger so LP depositors receive their pro-rata fee share.
+    // Run fire-and-forget so LP vault crank failures don't block the cycle.
+    // Only check markets that were in the toCrank list (skip permanently failed / skipped).
+    if (success > 0) {
+      const connection = getConnection();
+      const keypair = this._keypair;
+      for (const slabAddress of toCrank) {
+        const state = this.markets.get(slabAddress);
+        if (!state) continue;
+        // Fire LP vault crank asynchronously — don't await so it doesn't slow down the cycle.
+        crankLpVault(connection, state.market.programId, state.market, keypair).catch(() => {});
+      }
+    }
 
     // BM7: Log detailed error summary if any failed
     if (batchResult.failed > 0) {

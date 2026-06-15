@@ -92,10 +92,12 @@ const BPS_MULTIPLIER = 10_000n; // Basis points multiplier (100% = 10000 bps)
 
 /**
  * v17 portfolio account total size.
- * HEADER(16) + PortfolioAccountV16Account(9231) + PORTFOLIO_MATCHER_CONFIG_LEN(104) = 9351.
- * Used as the dataSize filter when scanning for portfolio accounts via getProgramAccounts.
+ * HEADER(16) + PortfolioAccountV16Account(9227) + PORTFOLIO_MATCHER_CONFIG_LEN(104) = 9347.
+ * (size_of::<PortfolioAccountV16Account>()=9227; CloseProgressLedgerV16Account is 184 bytes, not 188.)
+ * Used as the EXACT dataSize filter when scanning for portfolio accounts via getProgramAccounts —
+ * must equal constants::PORTFOLIO_ACCOUNT_LEN in percolator-prog or every query matches zero accounts.
  */
-const V17_PORTFOLIO_ACCOUNT_LEN = 9_351;
+const V17_PORTFOLIO_ACCOUNT_LEN = 9_347;
 
 /**
  * Offset of the market_group_id within a v17 portfolio account (at provenance_header offset 0).

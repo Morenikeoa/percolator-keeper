@@ -66,12 +66,14 @@ const V17_MAGIC_BYTES = new Uint8Array([0x00, 0x36, 0x31, 0x56, 0x43, 0x52, 0x45
  *   residual_received_atoms_total(16) + fee_credits(16) + cancel_deposit_escrow(16) +
  *   last_fee_slot(8) + active_bitmap(8) + legs[16](16×144=2304) +
  *   source_domains[32](32×196=6272) + health_cert(121) + stale_state(1) + b_stale_state(1) +
- *   rebalance_lock(1) + liquidation_lock(1) + close_progress(188) + resolved_payout_receipt(66) = 9231.
- * Total = 16 + 9231 + 104 = 9351.
+ *   rebalance_lock(1) + liquidation_lock(1) + close_progress(184) + resolved_payout_receipt(66) = 9227.
+ * Total = 16 + 9227 + 104 = 9347. (CloseProgressLedgerV16Account is 184 bytes, not 188 — all V16PodU*
+ * fields are align-1 byte arrays, no padding. sizeof(PortfolioAccountV16Account)=9227.)
  *
- * DESYNC-2/3 FIX: Used as the dataSize filter when querying portfolio accounts.
+ * DESYNC-2/3 FIX: Used as the EXACT dataSize filter when querying portfolio accounts; must equal
+ * constants::PORTFOLIO_ACCOUNT_LEN in percolator-prog or getProgramAccounts matches zero accounts.
  */
-const V17_PORTFOLIO_ACCOUNT_LEN = 9351;
+const V17_PORTFOLIO_ACCOUNT_LEN = 9347;
 
 /**
  * Offset of the market_group_id field within a v17 portfolio account.
@@ -178,8 +180,11 @@ async function discoverV17Markets(
   connection: Connection,
   programId: PublicKey,
 ): Promise<DiscoveredMarket[]> {
-  // v17 magic as base58 for memcmp filter
-  const v17MagicBase58 = new PublicKey(V17_MAGIC_BYTES).toBase58();
+  // memcmp `bytes` must encode the EXACT raw bytes to match. Use base64 (web3.js >=1.87) so
+  // sub-32-byte filters work — `new PublicKey(bytes)` left-pads to 32 bytes and base58.slice() is
+  // not byte-aligned, both of which previously made these filters match ZERO v17 accounts.
+  const v17MagicBase64 = Buffer.from(V17_MAGIC_BYTES).toString("base64"); // 8-byte MAGIC at offset 0
+  const kindMarketBase64 = Buffer.from(Uint8Array.from([1])).toString("base64"); // KIND_MARKET=1 at offset 10
   let rawAccounts: ReadonlyArray<{ pubkey: PublicKey; account: { data: Buffer | Uint8Array; owner: PublicKey } }>;
   try {
     rawAccounts = await withTimeout(
@@ -188,14 +193,16 @@ async function discoverV17Markets(
           {
             memcmp: {
               offset: 0,
-              bytes: v17MagicBase58,
+              bytes: v17MagicBase64,
+              encoding: "base64",
             },
           },
           // Filter for market group accounts (kind byte = 1 at offset 10)
           {
             memcmp: {
               offset: 10,
-              bytes: new PublicKey(new Uint8Array([1, ...new Array(31).fill(0)])).toBase58().slice(0, 4),
+              bytes: kindMarketBase64,
+              encoding: "base64",
             },
           },
         ],

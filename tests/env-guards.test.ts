@@ -167,6 +167,7 @@ describe("validateKeeperEnvGuards", () => {
         RPC_URL: "https://api.mainnet-beta.solana.com",
         KEEPER_REDIS_URL: "https://fake-host.upstash.io",
         KEEPER_REDIS_TOKEN: "fake-token",
+        DISCORD_ALERT_WEBHOOK: "https://discord.com/api/webhooks/123/abc",
       } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
     });
@@ -355,6 +356,7 @@ describe("validateKeeperEnvGuards", () => {
         SOLANA_RPC_WS_URL: "wss://mainnet.helius-rpc.com/?api-key=xxx",
         FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
         RPC_URL: "https://mainnet.helius-rpc.com/?api-key=xxx",
+        DISCORD_ALERT_WEBHOOK: "https://discord.com/api/webhooks/123/abc",
       } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
     });
@@ -511,6 +513,7 @@ describe("validateKeeperEnvGuards", () => {
         SOLANA_RPC_WS_URL: "wss://mainnet.helius-rpc.com/?api-key=test",
         FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
         RPC_URL: MAINNET,
+        DISCORD_ALERT_WEBHOOK: "https://discord.com/api/webhooks/123/abc",
       } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
     });
@@ -523,6 +526,7 @@ describe("validateKeeperEnvGuards", () => {
         SOLANA_RPC_URL: "https://my-devnet-migration.example.com",
         RPC_URL: "https://my-devnet-migration.example.com",
         FALLBACK_RPC_URL: "https://my-devnet-migration.example.com",
+        DISCORD_ALERT_WEBHOOK: "https://discord.com/api/webhooks/123/abc",
       } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
     });
@@ -552,6 +556,72 @@ describe("validateKeeperEnvGuards", () => {
         FALLBACK_RPC_URL: "https://api.devnet.solana.com",
       } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+  });
+
+  // H-7 (HIGH): @percolatorct/shared's sendAlert() silently no-ops (logger.debug,
+  // no throw, no fallback channel) when DISCORD_ALERT_WEBHOOK is unset. Every
+  // sendCriticalAlert/sendWarningAlert/sendInfoAlert call in the keeper --
+  // including conservation-invariant violations and budget circuit-breaker trips
+  // -- would fire and vanish with zero operator-visible signal on mainnet.
+  describe("H-7: DISCORD_ALERT_WEBHOOK required on mainnet", () => {
+    const MAINNET = "https://mainnet.helius-rpc.com/?api-key=test";
+
+    it("throws when DISCORD_ALERT_WEBHOOK is unset on mainnet", () => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: MAINNET,
+        RPC_URL: MAINNET,
+        FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /DISCORD_ALERT_WEBHOOK must be set.*NETWORK=mainnet/i,
+      );
+    });
+
+    it("throws when DISCORD_ALERT_WEBHOOK is empty string on mainnet", () => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: MAINNET,
+        RPC_URL: MAINNET,
+        FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
+        DISCORD_ALERT_WEBHOOK: "",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /DISCORD_ALERT_WEBHOOK must be set/i,
+      );
+    });
+
+    it("throws when DISCORD_ALERT_WEBHOOK is whitespace-only on mainnet", () => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: MAINNET,
+        RPC_URL: MAINNET,
+        FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
+        DISCORD_ALERT_WEBHOOK: "   ",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /DISCORD_ALERT_WEBHOOK must be set/i,
+      );
+    });
+
+    it("accepts a complete mainnet env with DISCORD_ALERT_WEBHOOK set", () => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: MAINNET,
+        SOLANA_RPC_WS_URL: "wss://mainnet.helius-rpc.com/?api-key=test",
+        RPC_URL: MAINNET,
+        FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
+        DISCORD_ALERT_WEBHOOK: "https://discord.com/api/webhooks/123/abc",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+
+    it("does NOT require DISCORD_ALERT_WEBHOOK off mainnet (devnet/unset)", () => {
+      expect(() =>
+        validateKeeperEnvGuards({ NETWORK: "devnet" } as NodeJS.ProcessEnv),
+      ).not.toThrow();
+      expect(() => validateKeeperEnvGuards({} as NodeJS.ProcessEnv)).not.toThrow();
     });
   });
 

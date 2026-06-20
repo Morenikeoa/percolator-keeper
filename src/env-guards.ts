@@ -260,5 +260,24 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
           "liquidation retry on devnet, discovering zero mainnet markets.",
       );
     }
+
+    // H-7 (HIGH): @percolatorct/shared's sendAlert() reads DISCORD_ALERT_WEBHOOK
+    // directly and, when unset, does logger.debug(...) + return -- no throw, no
+    // fallback channel. Every sendCriticalAlert/sendWarningAlert/sendInfoAlert
+    // call in the keeper (conservation-invariant violations, crank-cycle hangs,
+    // oracle dual-source outages, budget circuit-breaker trips) would silently
+    // no-op on mainnet, leaving only a logger.error/logger.warn line as the sole
+    // survivor for incidents that are supposed to page someone. Require it
+    // explicitly on mainnet; unset is still fine off mainnet for local/devnet dev.
+    if (!env.DISCORD_ALERT_WEBHOOK?.trim()) {
+      throw new Error(
+        "DISCORD_ALERT_WEBHOOK must be set when NETWORK=mainnet. It is unset, " +
+          "and @percolatorct/shared's sendAlert() silently no-ops (logger.debug, " +
+          "no throw, no fallback channel) when the webhook is missing -- every " +
+          "sendCriticalAlert/sendWarningAlert/sendInfoAlert call (conservation " +
+          "invariant violations, crank hangs, oracle outages, budget halts) " +
+          "would fire and vanish with no operator-visible signal.",
+      );
+    }
   }
 }

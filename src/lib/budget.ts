@@ -375,13 +375,41 @@ export class KeeperBudget {
     this._realizedCostDriftLamports += delta;
     this._realizedCostSamples++;
 
+    // H-4: this runs ~5s after the original send (see keeper-send.ts's
+    // scheduleRealizedCostReconciliation), which can straddle a cycle-window
+    // boundary (default 30s). Roll first, same as canSpend/recordTx/getStats,
+    // so the cycle adjustment always lands in whichever cycle is current
+    // right now rather than a stale pre-roll snapshot that's about to be
+    // wiped by the next roll.
+    const nowMs = this._now();
+    this._rollCycleIfElapsed(nowMs);
+
     // Adjust running totals. Clamp at 0 so a large negative reconciliation
     // (e.g., we estimated 50k but only spent 5k) doesn't drive counters
     // negative — that would falsely make the budget look "underused" and
     // allow more spend than the operator intended in this cycle.
     this._cycleSpend = Math.max(0, this._cycleSpend + delta);
-    this._hourSpendSum = Math.max(0, this._hourSpendSum + delta);
-    this._daySpendSum = Math.max(0, this._daySpendSum + delta);
+
+    // Route the hour/day adjustment through the same SpendEvent + _pruneOld
+    // mechanism recordTx() uses, instead of mutating the scalars directly —
+    // _pruneOld only knows how to decrement these sums by shifting entries
+    // off _hourEvents/_dayEvents, so a bare scalar mutation here would never
+    // be backed by a prunable event and would permanently desync the sum
+    // from the event log. Store the amount ACTUALLY applied to the scalar
+    // (post zero-floor clamp), not the raw delta — otherwise pruning this
+    // event later would subtract more (or less) than was ever really added,
+    // desyncing the scalar in the opposite direction once it ages out.
+    const hourApplied = Math.max(0, this._hourSpendSum + delta) - this._hourSpendSum;
+    if (hourApplied !== 0) {
+      this._hourSpendSum += hourApplied;
+      this._hourEvents.push({ ts: nowMs, lamports: hourApplied });
+    }
+    const dayApplied = Math.max(0, this._daySpendSum + delta) - this._daySpendSum;
+    if (dayApplied !== 0) {
+      this._daySpendSum += dayApplied;
+      this._dayEvents.push({ ts: nowMs, lamports: dayApplied });
+    }
+    this._pruneOld(nowMs);
 
     if (process.env.KEEPER_BUDGET_DEBUG === "true") {
       logger.debug("adjustForRealizedCost", {

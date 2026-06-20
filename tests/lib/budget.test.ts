@@ -631,4 +631,89 @@ describe("KeeperBudget — M12 adjustForRealizedCost", () => {
     b.adjustForRealizedCost(150, 170, "crank"); // now cycleSpend = 170
     expect(b.canSpend(40, "crank")).toBe(false); // 170 + 40 = 210 > 200
   });
+
+  // H-4: adjustForRealizedCost never rolled the cycle window before touching
+  // _cycleSpend, so a reconciliation arriving after a cycle boundary (the
+  // 5s keeper-send.ts delay vs. a 30s default cycleWindowMs) blended its
+  // delta into whatever unrelated transactions had already landed in the
+  // NEW cycle. It also mutated _hourSpendSum/_daySpendSum directly with no
+  // backing SpendEvent, permanently desyncing them from what _pruneOld
+  // expects to decrement as entries age out.
+  describe("H-4: cycle-roll safety + hour/day event sync", () => {
+    it("rolls the cycle before applying a reconciliation that lands after the cycle window elapsed", () => {
+      const clock = makeClock();
+      const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
+
+      b.recordTx(100, "crank", "success"); // cycle A: cycleSpend = 100
+      expect(b.getStats().cycleSpend).toBe(100);
+
+      clock.advance(30_000); // cycle window elapses before reconciliation fires
+      b.recordTx(40, "crank", "success"); // unrelated tx lands in the NEW cycle B
+      expect(b.getStats().cycleSpend).toBe(40); // cycle A's 100 already rolled away
+
+      // Late reconciliation for the ORIGINAL (cycle A) tx: realized cost was
+      // 60 lamports higher than estimated.
+      b.adjustForRealizedCost(100, 160, "crank");
+
+      // The +60 must land in the cycle that's current NOW (cycle B), not get
+      // silently lost against a stale pre-roll snapshot of cycle A.
+      expect(b.getStats().cycleSpend).toBe(100); // 40 + 60
+    });
+
+    it("does not disturb the cycle counter when reconciliation arrives within the same (unrolled) cycle", () => {
+      const clock = makeClock();
+      const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
+      b.recordTx(100, "crank", "success");
+      clock.advance(5_000); // typical reconciliation delay, well under the 30s window
+      b.adjustForRealizedCost(100, 160, "crank");
+      expect(b.getStats().cycleSpend).toBe(160); // unchanged from pre-fix behavior
+    });
+
+    it("hourSpend/daySpend decay back to zero once both the original event and the delta event age out", () => {
+      const clock = makeClock();
+      const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now });
+
+      b.recordTx(100, "crank", "success");
+      b.adjustForRealizedCost(100, 150, "crank"); // delta +50
+      expect(b.getStats().hourSpend).toBe(150);
+
+      // Pre-fix: the +50 was never backed by a SpendEvent, so hourSpend would
+      // stay at 150 forever, never pruned. Post-fix: it was pushed as its own
+      // event and prunes out along with the original 100 once the hour window
+      // elapses.
+      clock.advance(3_600_001);
+      const s = b.getStats();
+      expect(s.hourSpend).toBe(0);
+      expect(s.daySpend).toBe(150); // day window (24h) hasn't elapsed yet
+    });
+
+    it("a clamped negative delta event does not desync the scalar once it ages out (stores the applied amount, not the raw delta)", () => {
+      const clock = makeClock();
+      const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now });
+
+      b.recordTx(50, "crank", "success"); // hourSpend = 50
+      // Raw delta = -200, but only 50 is available — clamps to 0. If the
+      // RAW -200 were stored as the event (instead of the -50 actually
+      // applied), pruning it later would subtract -200 (i.e. ADD 200) from
+      // a sum that only ever lost 50, desyncing it positive.
+      b.adjustForRealizedCost(250, 50, "crank");
+      expect(b.getStats().hourSpend).toBe(0);
+
+      clock.advance(3_600_001); // expire both events
+      const s = b.getStats();
+      expect(s.hourSpend).toBe(0); // must settle at exactly 0, never positive or negative
+      expect(s.daySpend).toBeGreaterThanOrEqual(0);
+    });
+
+    it("realizedCostDriftLamports always reflects the full unclamped delta, independent of cycle roll or hour/day clamping", () => {
+      const clock = makeClock();
+      const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
+      b.recordTx(100, "crank", "success");
+      clock.advance(30_000);
+      b.adjustForRealizedCost(100, 175, "crank");
+      const s = b.getStats();
+      expect(s.realizedCostDriftLamports).toBe(75);
+      expect(s.realizedCostSamples).toBe(1);
+    });
+  });
 });

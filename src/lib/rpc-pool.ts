@@ -68,6 +68,29 @@ export interface RpcReadInterface {
   getLatestBlockhash(commitment?: string): Promise<BlockhashWithExpiryBlockHeight>;
 }
 
+/**
+ * M-3: classify an RPC failure as a real timeout by inspecting the error
+ * itself, not by how long the call happened to take. The previous
+ * latency-only heuristic mislabeled a fast-failing non-timeout error (a
+ * malformed-request 400, an auth rejection, a DNS failure) that happened to
+ * exceed unhealthyP99Ms as "timeout", and a genuine client-side abort/socket
+ * timeout that resolved quickly as "fail" -- misleading the
+ * keeper_rpc_request_total metric used to triage incidents.
+ */
+function isTimeoutError(err: unknown): boolean {
+  if (err instanceof Error) {
+    if (err.name === "AbortError" || err.name === "TimeoutError") return true;
+    const msg = err.message.toLowerCase();
+    return (
+      msg.includes("timeout") ||
+      msg.includes("timed out") ||
+      msg.includes("etimedout") ||
+      msg.includes("esockettimedout")
+    );
+  }
+  return false;
+}
+
 export class RpcPool {
   private readonly _config: RpcPoolConfig;
   private readonly _helius: Connection;
@@ -250,7 +273,7 @@ export class RpcPool {
       return result;
     } catch (err) {
       const latencyMs = this._now() - start;
-      const isTimeout = latencyMs > this._config.unhealthyP99Ms;
+      const isTimeout = isTimeoutError(err) || latencyMs > this._config.unhealthyP99Ms;
       rpcRequestTotal.inc({ provider, method, result: isTimeout ? "timeout" : "fail" });
 
       if (provider === "helius") {

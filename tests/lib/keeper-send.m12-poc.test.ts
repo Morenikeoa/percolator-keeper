@@ -38,7 +38,7 @@ vi.mock("../../src/lib/priority-fee.js", () => {
 vi.mock("../../src/lib/cu-estimator.js", () => {
   class CuEstimator {
     // Simulator says 200k. Reality (below) will be 600k.
-    estimate = vi.fn(async () => 200_000);
+    estimate = vi.fn(async () => ({ cu: 200_000, provenToFail: false }));
   }
   return { CuEstimator };
 });

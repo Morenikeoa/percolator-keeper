@@ -112,6 +112,9 @@ function isMainnetSender(): boolean {
 interface EstimateCostResult {
   estimatedCost: number;
   simulatedCu: number;
+  /** H-3: true iff simulation proved this exact tx would fail on-chain. */
+  provenToFail: boolean;
+  simError?: unknown;
 }
 
 /**
@@ -129,7 +132,7 @@ async function estimateCost(
     .flatMap((ix) => ix.keys.map((k) => k.pubkey.toBase58()))
     .filter((v, i, a) => a.indexOf(v) === i);
 
-  const [microLamports, simulatedCu] = await Promise.all([
+  const [microLamports, cuResult] = await Promise.all([
     getPriorityFeeEstimator().estimate(accountKeys, TIER_MAP[txType]),
     getCuEstimator().estimate(connection, instructions, signers),
   ]);
@@ -138,7 +141,12 @@ async function estimateCost(
     ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
     : 0;
 
-  return { estimatedCost: estimateLamportCost(microLamports, simulatedCu, jitoTip), simulatedCu };
+  return {
+    estimatedCost: estimateLamportCost(microLamports, cuResult.cu, jitoTip),
+    simulatedCu: cuResult.cu,
+    provenToFail: cuResult.provenToFail,
+    simError: cuResult.simError,
+  };
 }
 
 export interface KeeperSendResult {
@@ -206,7 +214,27 @@ export async function keeperSend(
     ...instructions,
   ];
 
-  const { estimatedCost, simulatedCu } = await estimateCost(connection, instructions, signers, txType);
+  const { estimatedCost, simulatedCu, provenToFail, simError } = await estimateCost(
+    connection,
+    instructions,
+    signers,
+    txType,
+  );
+
+  // H-3: simulateTransaction can report a positive unitsConsumed even when
+  // the tx fails (CU is metered up to the point of failure), so CuEstimator
+  // separately proves failure via the program's own InstructionError. Abort
+  // before the budget gate -- no reservation is taken, so this is a pure
+  // skip, same "don't treat as failure" contract as the leader-check and
+  // budget-gate paths below.
+  if (provenToFail) {
+    logger.warn("keeperSend: simulation proved tx will fail — skipping send", {
+      txType,
+      simulatedCu,
+      err: simError,
+    });
+    return null;
+  }
 
   if (!budget.canSpend(estimatedCost, txType)) {
     logger.warn("Budget gate: refusing send — budget exhausted or halted", {

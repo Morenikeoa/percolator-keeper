@@ -17,9 +17,10 @@ vi.mock("../../src/lib/priority-fee.js", () => {
   return { HeliusPriorityFeeEstimator };
 });
 
+const mockCuEstimate = vi.fn(async () => ({ cu: 200_000, provenToFail: false }));
 vi.mock("../../src/lib/cu-estimator.js", () => {
   class CuEstimator {
-    estimate = vi.fn(async () => 200_000);
+    estimate = mockCuEstimate;
   }
   return { CuEstimator };
 });
@@ -81,6 +82,47 @@ describe("keeperSend", () => {
 
     expect(result).toBeNull();
     expect(shared.sendWithRetryKeeper).not.toHaveBeenCalled();
+  });
+
+  // H-3: CuEstimator can prove (via the program's own InstructionError) that
+  // a transaction will fail on-chain. keeperSend must skip the send entirely
+  // -- sending it anyway (often with skipPreflight:true) would pay a real
+  // fee on a guaranteed revert.
+  describe("H-3: aborts when simulation proves the tx will fail", () => {
+    it("returns null and never calls sendWithRetryKeeper", async () => {
+      mockCuEstimate.mockResolvedValueOnce({
+        cu: 50_000,
+        provenToFail: true,
+        simError: { InstructionError: [0, { Custom: 6001 }] },
+      });
+
+      const result = await keeperSend(connection, [makeDummyIx()], [keypair], "crank", budget);
+
+      expect(result).toBeNull();
+      expect(shared.sendWithRetryKeeper).not.toHaveBeenCalled();
+    });
+
+    it("does not reserve or record any budget spend", async () => {
+      mockCuEstimate.mockResolvedValueOnce({
+        cu: 50_000,
+        provenToFail: true,
+        simError: "InsufficientFundsForRent",
+      });
+
+      const before = budget.getStats();
+      await keeperSend(connection, [makeDummyIx()], [keypair], "liquidation", budget);
+      const after = budget.getStats();
+
+      expect(after.cycleTxCount).toBe(before.cycleTxCount);
+      expect(after.cycleSpend).toBe(before.cycleSpend);
+    });
+
+    it("still sends normally when provenToFail is false (happy path unaffected)", async () => {
+      const result = await keeperSend(connection, [makeDummyIx()], [keypair], "crank", budget);
+
+      expect(result).not.toBeNull();
+      expect(shared.sendWithRetryKeeper).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("records success in budget on successful send", async () => {

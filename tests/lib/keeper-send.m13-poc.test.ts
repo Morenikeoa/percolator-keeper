@@ -41,7 +41,7 @@ vi.mock("../../src/lib/cu-estimator.js", () => {
   class CuEstimator {
     estimate = vi.fn(async () => {
       await new Promise((r) => setTimeout(r, 50));
-      return 200_000;
+      return { cu: 200_000, provenToFail: false };
     });
   }
   return { CuEstimator };

@@ -15,7 +15,7 @@ vi.mock("../../src/lib/priority-fee.js", () => {
   return { HeliusPriorityFeeEstimator };
 });
 vi.mock("../../src/lib/cu-estimator.js", () => {
-  class CuEstimator { estimate = vi.fn(async () => 200_000); }
+  class CuEstimator { estimate = vi.fn(async () => ({ cu: 200_000, provenToFail: false })); }
   return { CuEstimator };
 });
 

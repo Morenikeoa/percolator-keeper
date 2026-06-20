@@ -69,6 +69,7 @@ vi.mock('@percolatorct/shared', () => ({
     debug: vi.fn(),
   })),
   sendWarningAlert: vi.fn(),
+  sendCriticalAlert: vi.fn(async () => undefined),
   getConnection: vi.fn(() => ({
     getAccountInfo: vi.fn(),
     getLatestBlockhash: vi.fn(async () => ({
@@ -129,19 +130,25 @@ vi.mock('../../src/lib/keeper-send.js', async () => {
   };
 });
 
-vi.mock('../../src/lib/v17-risk.js', () => ({
-  parseV17RiskParams: vi.fn(() => ({
-    warmupPeriodSlots: 0n,
-    maintenanceMarginBps: 500n,
-    hMin: 0n,
-    hMax: 0n,
-    openInterestCap: 0n,
-    maintenanceFeePerSlot: 0n,
-    liquidationFeeShareBps: 0n,
-    adlFillCapBps: 0n,
-    minPositionSize: 0n,
-  })),
-}));
+vi.mock('../../src/lib/v17-risk.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/lib/v17-risk.js')>('../../src/lib/v17-risk.js');
+  return {
+    // Real class so `instanceof V17RiskParamsCorruptedError` checks in
+    // liquidation.ts still work against errors thrown by this mock.
+    V17RiskParamsCorruptedError: actual.V17RiskParamsCorruptedError,
+    parseV17RiskParams: vi.fn(() => ({
+      warmupPeriodSlots: 0n,
+      maintenanceMarginBps: 500n,
+      hMin: 0n,
+      hMax: 0n,
+      openInterestCap: 0n,
+      maintenanceFeePerSlot: 0n,
+      liquidationFeeShareBps: 0n,
+      adlFillCapBps: 0n,
+      minPositionSize: 0n,
+    })),
+  };
+});
 
 import { PublicKey, ComputeBudgetProgram } from '@solana/web3.js';
 import { LiquidationService } from '../../src/services/liquidation.js';
@@ -408,6 +415,103 @@ describe('LiquidationService', () => {
       const candidates = await liquidationService.scanMarket(mockMarket as any);
 
       expect(candidates).toHaveLength(0); // Skipped due to stale price and no fallback
+    });
+
+    // H-8: maintenanceMarginBps===0n (or out of range) makes the liquidation
+    // candidacy comparison unsatisfiable for every position, silently. The
+    // fix bails out loudly (alert + no candidates) instead.
+    describe('H-8: corrupted maintenanceMarginBps', () => {
+      const mockMarket = {
+        slabAddress: { toBase58: () => 'MarketCorrupt111111111111111111111111' },
+        programId: { toBase58: () => 'Program11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          oracleAuthority: { toBase58: () => 'Oracle11111111111111111111111111111111' },
+          indexFeedId: { toBytes: () => new Uint8Array(32) },
+          authorityPriceE6: 1_000_000n,
+          authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+      };
+
+      it('v12.x path: returns no candidates and fires sendCriticalAlert when maintenanceMarginBps is 0n', async () => {
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+        vi.mocked(core.parseEngine).mockReturnValue({ totalOpenInterest: 100_000_000n } as any);
+        vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 0n } as any);
+        vi.mocked(core.parseConfig).mockReturnValue({
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockZeroKey(),
+          authorityPriceE6: 1_000_000n,
+          lastEffectivePriceE6: 1_000_000n,
+          authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+        } as any);
+        vi.mocked(core.detectLayout).mockReturnValue({ accountsOffset: 0 } as any);
+
+        const candidates = await liquidationService.scanMarket(mockMarket as any);
+
+        expect(candidates).toEqual([]);
+        expect(shared.sendCriticalAlert).toHaveBeenCalledWith(
+          expect.stringContaining('risk params corrupted'),
+          expect.anything(),
+        );
+      });
+
+      it('v12.x path: alerts only once per market within the cooldown across repeated scans', async () => {
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+        vi.mocked(core.parseEngine).mockReturnValue({ totalOpenInterest: 100_000_000n } as any);
+        vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 0n } as any);
+        vi.mocked(core.parseConfig).mockReturnValue({
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockZeroKey(),
+          authorityPriceE6: 1_000_000n,
+          lastEffectivePriceE6: 1_000_000n,
+          authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+        } as any);
+        vi.mocked(core.detectLayout).mockReturnValue({ accountsOffset: 0 } as any);
+
+        await liquidationService.scanMarket(mockMarket as any);
+        await liquidationService.scanMarket(mockMarket as any);
+        await liquidationService.scanMarket(mockMarket as any);
+
+        expect(shared.sendCriticalAlert).toHaveBeenCalledTimes(1);
+      });
+
+      it('v17 path: returns no candidates and fires sendCriticalAlert when parseV17RiskParams throws V17RiskParamsCorruptedError', async () => {
+        vi.mocked(core.isV17Account).mockReturnValueOnce(true);
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(9_347));
+        const v17Risk = await import('../../src/lib/v17-risk.js');
+        vi.mocked(v17Risk.parseV17RiskParams).mockImplementationOnce(() => {
+          throw new v17Risk.V17RiskParamsCorruptedError('maintenanceMarginBps', 0n);
+        });
+
+        const candidates = await liquidationService.scanMarket(mockMarket as any);
+
+        expect(candidates).toEqual([]);
+        expect(shared.sendCriticalAlert).toHaveBeenCalledWith(
+          expect.stringContaining('risk params corrupted'),
+          expect.anything(),
+        );
+      });
+
+      it('does NOT alert for a legitimate non-zero maintenanceMarginBps (no false positives)', async () => {
+        vi.mocked(core.fetchSlab).mockResolvedValue(new Uint8Array(1024));
+        vi.mocked(core.parseEngine).mockReturnValue({ totalOpenInterest: 100_000_000n } as any);
+        vi.mocked(core.parseParams).mockReturnValue({ maintenanceMarginBps: 500n } as any);
+        vi.mocked(core.parseConfig).mockReturnValue({
+          oracleAuthority: mockNonZeroKey(),
+          indexFeedId: mockZeroKey(),
+          authorityPriceE6: 1_000_000n,
+          lastEffectivePriceE6: 1_000_000n,
+          authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+        } as any);
+        vi.mocked(core.detectLayout).mockReturnValue({ accountsOffset: 0 } as any);
+        vi.mocked(core.parseUsedIndices).mockReturnValue([]);
+
+        await liquidationService.scanMarket(mockMarket as any);
+
+        expect(shared.sendCriticalAlert).not.toHaveBeenCalled();
+      });
     });
   });
 

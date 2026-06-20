@@ -31,6 +31,33 @@ function readU128LE(data: Uint8Array, offset: number): bigint {
   return lo | (hi << 64n);
 }
 
+/**
+ * H-8: maintenanceMarginBps gates the only line that decides whether a v17
+ * position is liquidatable (`marginRatioBps < maintenanceMarginBps` in
+ * liquidation.ts). computeMarginRatioBps() clamps marginRatioBps to exactly
+ * 0n whenever notional===0n or equity<=0n, so if maintenanceMarginBps is
+ * itself 0n -- an uninitialized account, a future on-chain layout change
+ * shifting this field's byte offset without a matching keeper update, or
+ * corrupted/zeroed bytes -- `0n < 0n` is always false: no position in that
+ * market, however underwater, is ever flagged liquidatable, silently. A
+ * value >= 10_000 bps (>=100% margin requirement) is equally not a coherent
+ * on-chain config and would cause the opposite failure: every position with
+ * any notional would immediately appear liquidatable. Neither is a real
+ * market configuration -- treat both as corrupted data and refuse to parse.
+ */
+export class V17RiskParamsCorruptedError extends Error {
+  constructor(
+    public readonly field: string,
+    public readonly value: bigint,
+  ) {
+    super(
+      `parseV17RiskParams: ${field}=${value} is out of the valid (0, 10000) bps range ` +
+        `(suspected corrupted/misaligned read)`,
+    );
+    this.name = "V17RiskParamsCorruptedError";
+  }
+}
+
 export function parseV17RiskParams(data: Uint8Array): {
   warmupPeriodSlots: bigint;
   maintenanceMarginBps: bigint;
@@ -48,12 +75,17 @@ export function parseV17RiskParams(data: Uint8Array): {
     );
   }
 
+  const maintenanceMarginBps = readU64LE(
+    data,
+    V17_ENGINE_CONFIG_OFF + V17_ENGINE_CONFIG_MAINTENANCE_MARGIN_BPS_OFF,
+  );
+  if (maintenanceMarginBps <= 0n || maintenanceMarginBps >= 10_000n) {
+    throw new V17RiskParamsCorruptedError("maintenanceMarginBps", maintenanceMarginBps);
+  }
+
   return {
     warmupPeriodSlots: 0n,
-    maintenanceMarginBps: readU64LE(
-      data,
-      V17_ENGINE_CONFIG_OFF + V17_ENGINE_CONFIG_MAINTENANCE_MARGIN_BPS_OFF,
-    ),
+    maintenanceMarginBps,
     hMin: readU64LE(data, V17_ENGINE_CONFIG_OFF + V17_ENGINE_CONFIG_H_MIN_OFF),
     hMax: readU64LE(data, V17_ENGINE_CONFIG_OFF + V17_ENGINE_CONFIG_H_MAX_OFF),
     openInterestCap: 0n,

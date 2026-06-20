@@ -1730,4 +1730,136 @@ describe('CrankService', () => {
       service.stop();
     });
   });
+
+  // M-1: consecutiveFailures reset, foreignOracleSkipped reset, and the
+  // permanentlySkipped cooldown re-enable previously only ran in the
+  // full-rediscover branch -- a market recovering via the LaserStream fast
+  // path stayed stuck until the next full rediscover (default 30 min).
+  describe('M-1: LaserStream fast-path applies recoverable-state transitions', () => {
+    const EXPECTED_PROGRAM_ID = 'ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv';
+    const SLAB = 'RecoverSlab111111111111111111111111111111111';
+
+    let restoreEnv: () => void;
+
+    beforeEach(() => {
+      const prev = process.env.KEEPER_USE_LASERSTREAM;
+      process.env.KEEPER_USE_LASERSTREAM = 'true';
+      restoreEnv = () => {
+        if (prev === undefined) delete process.env.KEEPER_USE_LASERSTREAM;
+        else process.env.KEEPER_USE_LASERSTREAM = prev;
+      };
+    });
+
+    afterEach(() => {
+      restoreEnv();
+    });
+
+    function makeFakeLoader() {
+      return {
+        getCache: () => ({ getOwnerVerified: () => null }),
+        getProgramId: () => EXPECTED_PROGRAM_ID,
+        getStats: () => ({
+          connected: true,
+          lastSlot: 110,
+          eventsReceived: 0,
+          eventsDropped: 0,
+          reconnectCount: 0,
+        }),
+      } as any;
+    }
+
+    function makeMarket() {
+      return {
+        slabAddress: { toBase58: () => SLAB, equals: () => false },
+        programId: { toBase58: () => EXPECTED_PROGRAM_ID },
+        config: {
+          collateralMint: { toBase58: () => 'Mint1111111111111111111111111111111111111' },
+          oracleAuthority: { toBase58: () => 'Auth1111111111111111111111111111111111111', equals: () => false },
+          indexFeedId: { toBytes: () => new Uint8Array(32) },
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+      };
+    }
+
+    it('resets consecutiveFailures on a fast-path tick, not just on full rediscovery', async () => {
+      const service = new CrankService(mockOracleService, undefined, makeFakeLoader());
+      const internal: any = service;
+      internal.markets.set(SLAB, {
+        market: makeMarket(),
+        missingDiscoveryCount: 0,
+        consecutiveFailures: 7,
+        isActive: false,
+      });
+      internal._lastFullRediscoverTime = Date.now(); // stay in the fast-path window
+
+      await service.discover();
+
+      const state = internal.markets.get(SLAB);
+      expect(state.consecutiveFailures).toBe(0);
+      expect(state.isActive).toBe(true);
+
+      service.stop();
+    });
+
+    it('resets foreignOracleSkipped on a fast-path tick', async () => {
+      const service = new CrankService(mockOracleService, undefined, makeFakeLoader());
+      const internal: any = service;
+      internal.markets.set(SLAB, {
+        market: makeMarket(),
+        missingDiscoveryCount: 0,
+        consecutiveFailures: 0,
+        foreignOracleSkipped: true,
+      });
+      internal._lastFullRediscoverTime = Date.now();
+
+      await service.discover();
+
+      expect(internal.markets.get(SLAB).foreignOracleSkipped).toBe(false);
+
+      service.stop();
+    });
+
+    it('re-enables a permanentlySkipped market on a fast-path tick once its cooldown has elapsed', async () => {
+      const service = new CrankService(mockOracleService, undefined, makeFakeLoader());
+      const internal: any = service;
+      internal.markets.set(SLAB, {
+        market: makeMarket(),
+        missingDiscoveryCount: 0,
+        consecutiveFailures: 0,
+        permanentlySkipped: true,
+        permanentlySkippedAt: Date.now() - 3_600_001, // 1h cooldown (skipCount=1) elapsed
+        skipCount: 1,
+      });
+      internal._lastFullRediscoverTime = Date.now();
+
+      await service.discover();
+
+      const state = internal.markets.get(SLAB);
+      expect(state.permanentlySkipped).toBe(false);
+      expect(state.consecutiveFailures).toBe(0);
+
+      service.stop();
+    });
+
+    it('does NOT re-enable a permanentlySkipped market on a fast-path tick while still in cooldown', async () => {
+      const service = new CrankService(mockOracleService, undefined, makeFakeLoader());
+      const internal: any = service;
+      internal.markets.set(SLAB, {
+        market: makeMarket(),
+        missingDiscoveryCount: 0,
+        consecutiveFailures: 0,
+        permanentlySkipped: true,
+        permanentlySkippedAt: Date.now(), // just skipped, cooldown not elapsed
+        skipCount: 1,
+      });
+      internal._lastFullRediscoverTime = Date.now();
+
+      await service.discover();
+
+      expect(internal.markets.get(SLAB).permanentlySkipped).toBe(true);
+
+      service.stop();
+    });
+  });
 });

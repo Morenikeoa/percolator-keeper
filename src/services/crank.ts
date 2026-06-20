@@ -881,6 +881,62 @@ export class CrankService {
     return ms + Math.floor(Math.random() * ms * 0.25);
   }
 
+  /**
+   * M-1: the three recoverable-state transitions below only require the
+   * market's own existing state (no fresh RPC discovery data), so they apply
+   * equally whether a market was just refreshed via the LaserStream fast
+   * path or via a full getProgramAccounts/MARKETS_FILTER rediscovery. They
+   * were previously inlined only in the full-rediscover branch, so a market
+   * stuck with elevated consecutiveFailures, foreignOracleSkipped=true, or in
+   * permanentlySkipped cooldown would not self-heal via the fast path for up
+   * to KEEPER_FULL_REDISCOVER_INTERVAL_MS (default 30 min) once LaserStream
+   * is enabled. Dead-market eviction (missingDiscoveryCount) is deliberately
+   * NOT included here -- it requires the full set of markets actually found
+   * by this cycle's RPC discovery to know what's missing, which the fast
+   * path (by design) never computes.
+   */
+  private _resetRecoverableMarketState(key: string, state: MarketCrankState): void {
+    // P1 FIX: Reset consecutiveFailures so markets can recover.
+    if (state.consecutiveFailures > 0) {
+      logger.debug("Resetting consecutive failures on rediscovery", {
+        slabAddress: key,
+        previousFailures: state.consecutiveFailures,
+      });
+      state.consecutiveFailures = 0;
+      state.isActive = true;
+    }
+    // GH#1508: Reset foreignOracleSkipped — oracle authority may have changed.
+    // crankMarket() will re-check and re-set it if the keeper is still not the authority.
+    if (state.foreignOracleSkipped) {
+      state.foreignOracleSkipped = false;
+      logger.debug("Re-checking foreign oracle skip on rediscovery", { slabAddress: key });
+    }
+    // PERC-381: Only re-enable permanently skipped (0x4) markets after a long cooldown
+    // to avoid crank→skip→rediscover→re-enable→crank thrash loop on stale slabs.
+    // Cooldown increases exponentially with skip count (1h, 2h, 4h, ... capped at 24h).
+    if (state.permanentlySkipped && state.permanentlySkippedAt) {
+      const skipCount = state.skipCount ?? 1;
+      const cooldownMs = Math.min(skipCount * 3_600_000, 24 * 3_600_000); // 1h per skip, max 24h
+      const elapsed = Date.now() - state.permanentlySkippedAt;
+      if (elapsed >= cooldownMs) {
+        state.permanentlySkipped = false;
+        state.consecutiveFailures = 0;
+        logger.info("Re-enabling permanently skipped market after cooldown", {
+          slabAddress: key,
+          cooldownMs,
+          skipCount,
+          elapsedMs: elapsed,
+        });
+      } else {
+        logger.debug("Permanently skipped market still in cooldown", {
+          slabAddress: key,
+          remainingMs: cooldownMs - elapsed,
+          skipCount,
+        });
+      }
+    }
+  }
+
   async discover(): Promise<DiscoveredMarket[]> {
     // When the LaserStream loader is active and the feature flag is set,
     // use the cache for the fast path. The slow-path full re-discover still
@@ -905,6 +961,10 @@ export class CrankService {
         let cacheHits = 0;
         for (const [, state] of this.markets) {
           const key = state.market.slabAddress.toBase58();
+          // M-1: run the same recoverable-state transitions the full-rediscover
+          // branch applies to "already known" markets, every fast-path tick --
+          // not just once every KEEPER_FULL_REDISCOVER_INTERVAL_MS.
+          this._resetRecoverableMarketState(key, state);
           const entry = cache.getOwnerVerified(key, currentSlot, expectedOwner);
           if (entry) {
             // Re-parse the slab from cached bytes so the market state reflects
@@ -1182,47 +1242,9 @@ export class CrankService {
           state.mainnetCA = dbMeta.mainnetCA;
         }
         state.missingDiscoveryCount = 0;
-        // P1 FIX: Reset consecutiveFailures on rediscovery so markets can recover.
-        // Previously, a market that hit MAX_CONSECUTIVE_FAILURES was dead until keeper restart.
-        // Now it gets a fresh chance every discovery cycle (default 5min).
-        if (state.consecutiveFailures > 0) {
-          logger.debug("Resetting consecutive failures on rediscovery", {
-            slabAddress: key,
-            previousFailures: state.consecutiveFailures,
-          });
-          state.consecutiveFailures = 0;
-          state.isActive = true;
-        }
-        // GH#1508: Reset foreignOracleSkipped on re-discovery — oracle authority may have changed.
-        // crankMarket() will re-check and re-set it if the keeper is still not the authority.
-        if (state.foreignOracleSkipped) {
-          state.foreignOracleSkipped = false;
-          logger.debug("Re-checking foreign oracle skip on rediscovery", { slabAddress: key });
-        }
-        // PERC-381: Only re-enable permanently skipped (0x4) markets after a long cooldown
-        // to avoid crank→skip→rediscover→re-enable→crank thrash loop on stale slabs.
-        // Cooldown increases exponentially with skip count (1h, 2h, 4h, ... capped at 24h).
-        if (state.permanentlySkipped && state.permanentlySkippedAt) {
-          const skipCount = state.skipCount ?? 1;
-          const cooldownMs = Math.min(skipCount * 3_600_000, 24 * 3_600_000); // 1h per skip, max 24h
-          const elapsed = Date.now() - state.permanentlySkippedAt;
-          if (elapsed >= cooldownMs) {
-            state.permanentlySkipped = false;
-            state.consecutiveFailures = 0;
-            logger.info("Re-enabling permanently skipped market after cooldown", {
-              slabAddress: key,
-              cooldownMs,
-              skipCount,
-              elapsedMs: elapsed,
-            });
-          } else {
-            logger.debug("Permanently skipped market still in cooldown", {
-              slabAddress: key,
-              remainingMs: cooldownMs - elapsed,
-              skipCount,
-            });
-          }
-        }
+        // M-1: P1 FIX / GH#1508 / PERC-381 transitions extracted into the
+        // shared helper so the LaserStream fast path applies them too.
+        this._resetRecoverableMarketState(key, state);
       }
     }
 

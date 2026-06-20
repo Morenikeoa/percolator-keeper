@@ -108,6 +108,43 @@ class FailingAdapter implements StreamAdapter {
   stop(): void {}
 }
 
+/**
+ * H-5: a FakeAdapter whose start() does not resolve until the test calls
+ * releaseStart() -- lets tests put connect() in a "mid-await" state to
+ * exercise stop() racing it.
+ */
+class DeferredStartAdapter implements StreamAdapter {
+  startCallCount = 0;
+  stopCallCount = 0;
+  private onAccount: ((u: AccountUpdate) => void) | null = null;
+  private resolveStart: (() => void) | null = null;
+
+  start(
+    _opts: AccountLoaderOptions,
+    onAccountUpdate: (u: AccountUpdate) => void,
+  ): Promise<void> {
+    this.startCallCount++;
+    this.onAccount = onAccountUpdate;
+    return new Promise<void>((resolve) => {
+      this.resolveStart = resolve;
+    });
+  }
+
+  /** Let the pending start() call resolve, simulating the handle becoming live. */
+  releaseStart(): void {
+    this.resolveStart?.();
+    this.resolveStart = null;
+  }
+
+  stop(): void {
+    this.stopCallCount++;
+  }
+
+  pushAccount(update: AccountUpdate): void {
+    this.onAccount?.(update);
+  }
+}
+
 function makeUpdate(pubkey: string, slot: number): AccountUpdate {
   return { pubkey, data: new Uint8Array([1, 2, 3]), owner: "owner", slot };
 }
@@ -526,4 +563,75 @@ describe("AccountLoader stress test", () => {
       await loader.stop();
     },
   );
+});
+
+// H-5: connect() awaits _snapshotKnownAccounts() then adapter.start(). If
+// stop() ran during either await, it found nothing to cancel yet (the
+// adapter's handle didn't exist) and was a no-op. connect()'s continuation
+// then unconditionally set connected=true with no check of `running`,
+// leaving a live, otherwise-uncancelled subscription after the loader was
+// told to stop.
+describe("AccountLoader — H-5: connect()/stop() race", () => {
+  it("does not report connected=true if stop() ran while adapter.start() was pending", async () => {
+    const deferred = new DeferredStartAdapter();
+    const l = new AccountLoader(BASE_OPTS, deferred);
+
+    const startPromise = l.start(); // connect() begins, awaits adapter.start() (held open)
+    await Promise.resolve(); // let connect() reach the adapter.start() await
+
+    await l.stop(); // running=false while adapter.start() is still pending
+    expect(deferred.stopCallCount).toBe(1); // the no-op call from stop() itself
+
+    deferred.releaseStart(); // simulate subscribe() finally resolving, handle now "live"
+    await startPromise;
+    await Promise.resolve();
+
+    // Core of H-5: must not report connected after stop() raced the await.
+    expect(l.getStats().connected).toBe(false);
+    // The now-live handle must be torn down -- adapter.stop() called a
+    // second time, after adapter.start() resolved, proving the post-resolve
+    // subscription was actually cancelled rather than left orphaned.
+    expect(deferred.stopCallCount).toBe(2);
+  });
+
+  it("does not deliver account updates pushed after stop() raced a pending connect()", async () => {
+    const deferred = new DeferredStartAdapter();
+    const l = new AccountLoader(BASE_OPTS, deferred);
+    const received: AccountUpdate[] = [];
+    l.onAccount((u) => received.push(u));
+
+    const startPromise = l.start();
+    await Promise.resolve();
+    await l.stop();
+
+    deferred.releaseStart();
+    await startPromise;
+    await Promise.resolve();
+
+    // Even though the adapter's internal handle resolved and is "live"
+    // until adapter.stop() cancels it, any update delivered in that window
+    // must be dropped by enqueue()'s running guard.
+    deferred.pushAccount(makeUpdate("pk-late", 999));
+    await Promise.resolve();
+
+    expect(received).toHaveLength(0);
+    expect(l.getStats().eventsReceived).toBe(0);
+  });
+
+  it("does not schedule a reconnect when stop() races a pending connect()", async () => {
+    vi.useFakeTimers();
+    const deferred = new DeferredStartAdapter();
+    const l = new AccountLoader(BASE_OPTS, deferred);
+
+    const startPromise = l.start();
+    await Promise.resolve();
+    await l.stop();
+
+    deferred.releaseStart();
+    await startPromise;
+    await vi.advanceTimersByTimeAsync(5_000);
+    vi.useRealTimers();
+
+    expect(l.getStats().reconnectCount).toBe(0);
+  });
 });

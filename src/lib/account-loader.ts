@@ -261,6 +261,11 @@ export class AccountLoader {
       // cache.set() calls and overwrite newer slot data with older RPC data.
       await this._snapshotKnownAccounts();
 
+      // H-5: stop() may have run while the snapshot RPC above was in flight.
+      // Don't bother starting a stream subscription for a loader that's
+      // already been told to stop.
+      if (!this.running) return;
+
       await this.adapter.start(
         this.opts,
         (update) => this.enqueue(update),
@@ -270,6 +275,18 @@ export class AccountLoader {
         },
         (err) => this.onStreamError(err),
       );
+
+      // H-5: stop() may instead have run while adapter.start() itself was in
+      // flight. At that point stop()'s call to adapter.stop() found no handle
+      // yet assigned (e.g. LaserStreamAdapter.handle is set only once
+      // subscribe() resolves) and was a no-op -- the subscription that just
+      // came up here is live and otherwise uncancelled. Tear it down now
+      // instead of marking the loader connected.
+      if (!this.running) {
+        this.adapter.stop();
+        return;
+      }
+
       this.connected = true;
       this.backoff.reset();
       logger.info("AccountLoader: stream connected", {
@@ -366,6 +383,11 @@ export class AccountLoader {
   }
 
   private enqueue(update: AccountUpdate): void {
+    // H-5: defense-in-depth, matching onStreamError()'s existing convention --
+    // discard any update delivered after stop() ran, in case the underlying
+    // transport delivers an already-in-flight callback before its
+    // cancellation fully takes effect.
+    if (!this.running) return;
     this.eventsReceived++;
     this.cache.set(update.pubkey, update.data, update.owner, update.slot);
 

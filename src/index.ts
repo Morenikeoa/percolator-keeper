@@ -19,6 +19,7 @@ import { getRedisClient } from "./lib/redis-client.js";
 import { LeaderLock, makeIdentity } from "./lib/leader.js";
 import { captureAndExit } from "./lib/exit-handlers.js";
 import { StartupTracker } from "./lib/startup-tracker.js";
+import { computeHealthStatus } from "./lib/health-status.js";
 import { sharedTxQueue, DRAIN_TIMEOUT_MS } from "./lib/tx-queue.js";
 import { sharedBudget, setLeaderCheck } from "./lib/keeper-send.js";
 import { initSharedShadowHarness, sharedShadowHarness } from "./lib/shadow-harness.js";
@@ -561,31 +562,20 @@ res.writeHead(401, secureJsonHeaders);
     const now = Date.now();
     const timeSinceLastCrank = mostRecentCrank > 0 ? now - mostRecentCrank : Infinity;
     const timeSinceLastOracle = mostRecentOracle > 0 ? now - mostRecentOracle : Infinity;
-    
-    // Determine health status
-    // Grace period: allow 5 minutes after startup before marking as "down"
-    const uptimeMs = now - startupTime;
-    let status: "ok" | "degraded" | "down" | "starting";
-    if (uptimeMs < 300_000 && mostRecentCrank === 0) {
-      status = "starting"; // Still warming up, no cranks yet
-    } else if (timeSinceLastCrank < 60_000) {
-      status = "ok";
-    } else if (timeSinceLastCrank < 300_000) {
-      status = "degraded";
-    } else {
-      status = "down";
-    }
 
-    // GH#2025: Also degrade/down if liquidation scanner has stalled
+    // Determine health status (M-2: extracted to a pure, testable helper —
+    // see src/lib/health-status.ts for why marketsTracked===0 short-circuits
+    // to "ok" rather than falling through to "down").
+    const uptimeMs = now - startupTime;
     const liqScanStatus = liquidationService.getStatus();
-    if (uptimeMs >= 300_000 && liqScanStatus.running) {
-      const timeSinceLiqScan = liqScanStatus.lastScanTime > 0 ? now - liqScanStatus.lastScanTime : Infinity;
-      if (timeSinceLiqScan > 300_000 && status !== "down") {
-        status = "down"; // Liquidation scan stalled >5 min
-      } else if (timeSinceLiqScan > 120_000 && status === "ok") {
-        status = "degraded"; // Liquidation scan stalled >2 min
-      }
-    }
+    const status = computeHealthStatus({
+      uptimeMs,
+      mostRecentCrank,
+      marketsTracked,
+      timeSinceLastCrank,
+      liqScanRunning: liqScanStatus.running,
+      timeSinceLiqScan: liqScanStatus.lastScanTime > 0 ? now - liqScanStatus.lastScanTime : Infinity,
+    });
     
     // ADL removed in v17 — always disabled.
     const adlStats: Record<string, unknown> = { enabled: false };

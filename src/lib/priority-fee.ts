@@ -8,6 +8,7 @@ export type PriorityFeeTier = "crank" | "liquidation" | "oracle" | "adl";
 
 const FALLBACK_MICROLAMPORTS = 1_000;
 const DEFAULT_CACHE_MS = 5_000;
+const DEFAULT_CACHE_MAX_ENTRIES = 1_000;
 
 /** Default percentiles per tier (overridable via env). ADL is liquidation-priority. */
 const DEFAULT_PERCENTILES: Record<PriorityFeeTier, number> = {
@@ -80,9 +81,10 @@ function percentileToLevel(p: number): string {
 export class HeliusPriorityFeeEstimator implements PriorityFeeEstimator {
   private readonly _rpcUrl: string;
   private readonly _cacheMs: number;
+  private readonly _cacheMaxEntries: number;
   private readonly _cache = new Map<string, { value: number; expiresAt: number }>();
 
-  constructor(rpcUrl?: string, opts?: { cacheMs?: number }) {
+  constructor(rpcUrl?: string, opts?: { cacheMs?: number; cacheMaxEntries?: number }) {
     this._rpcUrl =
       rpcUrl ??
       process.env.HELIUS_RPC_URL ??
@@ -92,6 +94,34 @@ export class HeliusPriorityFeeEstimator implements PriorityFeeEstimator {
     this._cacheMs =
       opts?.cacheMs ??
       parseInt(process.env.KEEPER_PRIORITY_FEE_CACHE_MS ?? String(DEFAULT_CACHE_MS), 10);
+    this._cacheMaxEntries =
+      opts?.cacheMaxEntries ??
+      parseInt(
+        process.env.KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES ?? String(DEFAULT_CACHE_MAX_ENTRIES),
+        10,
+      );
+  }
+
+  /**
+   * The cache key is derived from the full account-key set, which varies
+   * per market/instruction shape and grows without bound over the life of
+   * a long-running keeper as markets are added/removed and discovery
+   * cycles touch new account combinations. Without this, entries for
+   * stale/never-repeated key sets would accumulate in `_cache` forever
+   * (Map.set never overwrites a *different* key, and nothing else ever
+   * deletes from it).
+   */
+  private _evictStaleEntries(now: number): void {
+    for (const [key, entry] of this._cache) {
+      if (now >= entry.expiresAt) {
+        this._cache.delete(key);
+      }
+    }
+    while (this._cache.size >= this._cacheMaxEntries) {
+      const oldestKey = this._cache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this._cache.delete(oldestKey);
+    }
   }
 
   async estimate(accountKeys: string[], tier: PriorityFeeTier): Promise<number> {
@@ -144,7 +174,9 @@ export class HeliusPriorityFeeEstimator implements PriorityFeeEstimator {
       }
 
       const value = Math.round(fee);
-      this._cache.set(cacheKey, { value, expiresAt: Date.now() + this._cacheMs });
+      const now = Date.now();
+      this._evictStaleEntries(now);
+      this._cache.set(cacheKey, { value, expiresAt: now + this._cacheMs });
       // Only emit the gauge for non-trivial fees to avoid label noise from zero-fee routes.
       if (value > 0) {
         priorityFeeMicrolamports.set({ accountSet_hash: accountSetHash(accountKeys), tier }, value);

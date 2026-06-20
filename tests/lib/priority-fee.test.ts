@@ -192,4 +192,83 @@ describe("HeliusPriorityFeeEstimator", () => {
       else process.env.KEEPER_PRIORITY_FEE_PERCENTILE_CRANK = origEnv;
     }
   });
+
+  describe("M-4: bounded cache size", () => {
+    function cacheSize(estimator: HeliusPriorityFeeEstimator): number {
+      return (estimator as unknown as { _cache: Map<string, unknown> })._cache.size;
+    }
+
+    it("never exceeds cacheMaxEntries even with many distinct never-repeated account-key sets", async () => {
+      global.fetch = mockFetch(HELIUS_SUCCESS_RESPONSE);
+      const estimator = new HeliusPriorityFeeEstimator("https://rpc.example.com", {
+        cacheMs: 60_000,
+        cacheMaxEntries: 5,
+      });
+
+      for (let i = 0; i < 20; i++) {
+        await estimator.estimate([`acc${i}`], "crank");
+      }
+
+      expect(cacheSize(estimator)).toBeLessThanOrEqual(5);
+    });
+
+    it("evicts the oldest entry once cacheMaxEntries is reached, forcing a re-fetch for it", async () => {
+      const fetchFn = mockFetch(HELIUS_SUCCESS_RESPONSE);
+      global.fetch = fetchFn;
+      const estimator = new HeliusPriorityFeeEstimator("https://rpc.example.com", {
+        cacheMs: 60_000,
+        cacheMaxEntries: 2,
+      });
+
+      await estimator.estimate(["acc1"], "crank");
+      await estimator.estimate(["acc2"], "crank");
+      await estimator.estimate(["acc3"], "crank"); // pushes acc1 out
+
+      expect(fetchFn).toHaveBeenCalledTimes(3);
+
+      await estimator.estimate(["acc1"], "crank"); // evicted -- must re-fetch
+
+      expect(fetchFn).toHaveBeenCalledTimes(4);
+    });
+
+    it("sweeps expired entries on write instead of letting them accumulate until re-queried", async () => {
+      vi.useFakeTimers();
+      global.fetch = mockFetch(HELIUS_SUCCESS_RESPONSE);
+      const estimator = new HeliusPriorityFeeEstimator("https://rpc.example.com", {
+        cacheMs: 1_000,
+        cacheMaxEntries: 1_000,
+      });
+
+      await estimator.estimate(["acc1"], "crank");
+      expect(cacheSize(estimator)).toBe(1);
+
+      vi.advanceTimersByTime(1_001); // acc1's entry is now expired but never re-queried
+      await estimator.estimate(["acc2"], "crank");
+
+      // Without sweeping, both the expired acc1 entry and the new acc2 entry
+      // would sit in the map (size 2), even though acc1 is dead weight.
+      expect(cacheSize(estimator)).toBe(1);
+    });
+
+    it("reads cacheMaxEntries from KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES when no explicit option is given", async () => {
+      const origEnv = process.env.KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES;
+      process.env.KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES = "3";
+      try {
+        const fetchFn = mockFetch(HELIUS_SUCCESS_RESPONSE);
+        global.fetch = fetchFn;
+        const estimator = new HeliusPriorityFeeEstimator("https://rpc.example.com", {
+          cacheMs: 60_000,
+        });
+
+        for (let i = 0; i < 10; i++) {
+          await estimator.estimate([`acc${i}`], "crank");
+        }
+
+        expect(cacheSize(estimator)).toBeLessThanOrEqual(3);
+      } finally {
+        if (origEnv === undefined) delete process.env.KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES;
+        else process.env.KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES = origEnv;
+      }
+    });
+  });
 });

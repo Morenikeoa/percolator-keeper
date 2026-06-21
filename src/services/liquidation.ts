@@ -16,7 +16,7 @@ import {
   parsePortfolioV17,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
-import { config, getConnection, loadKeypair, sendWithRetry, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
+import { config, getConnection, loadKeypair, sendWithRetry, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, sendCriticalAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
 import { resolveExternalOracleAccount } from "../lib/oracle-account.js";
 import { recordAttempt, recordLanded, recordFailed } from "../lib/sender-metrics.js";
@@ -30,7 +30,7 @@ import type { AccountLoader } from "../lib/account-loader.js";
 import { keeperSend, sharedBudget } from "../lib/keeper-send.js";
 import { sharedTxQueue } from "../lib/tx-queue.js";
 import { AlertAggregator } from "../lib/alert-aggregator.js";
-import { parseV17RiskParams } from "../lib/v17-risk.js";
+import { parseV17RiskParams, V17RiskParamsCorruptedError } from "../lib/v17-risk.js";
 import { resolveV17OracleTail } from "../lib/v17-oracle-tail.js";
 
 const logger = createLogger("keeper:liquidation");
@@ -182,7 +182,11 @@ async function scanV17Portfolios(
         const feeDebt = pf.feeCredits < 0n ? -pf.feeCredits : 0n;
         const equity = pf.capital + pf.pnl - feeDebt;
         const marginRatioBps = computeMarginRatioBps(equity, notional);
-        if (marginRatioBps < maintenanceMarginBps) {
+        // H-8 defense-in-depth: a position with equity<=0n is unambiguously
+        // bankrupt and liquidatable regardless of maintenanceMarginBps -- even
+        // if that value were somehow corrupted/zero despite parseV17RiskParams'
+        // own validation. Don't let a bad threshold mask the unconditional case.
+        if (equity <= 0n || marginRatioBps < maintenanceMarginBps) {
           candidates.push({
             portfolioPubkey: pubkey,
             owner: pf.owner.toBase58(),
@@ -378,6 +382,13 @@ export class LiquidationService {
   // PERC-484: Track markets that permanently fail with InvalidSlabLen (0x4).
   // These are test/corrupt markets with wrong slab size — skip them indefinitely.
   private readonly permanentlySkipped = new Set<string>();
+  // H-8: per-market cooldown latch for the "corrupted risk params" alert. A
+  // corrupted/zero maintenanceMarginBps is a sustained, unchanging condition
+  // re-evaluated every scan cycle (default 60s) -- not a burst of distinct
+  // events -- so this is a plain per-market timestamp map, not AlertAggregator
+  // (which collapses bursts within a few seconds, not a level held for hours).
+  private readonly _corruptedRiskParamsAlertedAt = new Map<string, number>();
+  private static readonly RISK_PARAMS_ALERT_COOLDOWN_MS = 15 * 60_000; // 15 min
   // Cache keypair at construction — avoids re-parsing from env on every liquidate() call
   private readonly _keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
   /** LaserStream account loader — injected for event-driven portfolio scanning. */
@@ -435,6 +446,31 @@ export class LiquidationService {
   }
 
   /**
+   * H-8: fire a CRITICAL alert at most once per RISK_PARAMS_ALERT_COOLDOWN_MS
+   * per market. A market stuck with a corrupted maintenanceMarginBps means bad
+   * debt can accumulate completely undetected -- no position in that market
+   * will ever be flagged liquidatable by the threshold comparison alone (the
+   * equity<=0n defense-in-depth still catches outright-bankrupt positions, but
+   * a near-bankrupt one with positive equity would not be) -- so this must be
+   * operator-visible, not a buried log line.
+   */
+  private _alertCorruptedRiskParams(slabAddress: string, err: Error): void {
+    logger.error("Corrupted risk params — liquidation may be degraded for this market", {
+      slabAddress,
+      error: err.message,
+    });
+    const now = Date.now();
+    const lastAlert = this._corruptedRiskParamsAlertedAt.get(slabAddress) ?? 0;
+    if (now - lastAlert > LiquidationService.RISK_PARAMS_ALERT_COOLDOWN_MS) {
+      this._corruptedRiskParamsAlertedAt.set(slabAddress, now);
+      sendCriticalAlert("Market risk params corrupted — liquidation may be degraded", [
+        { name: "Market", value: slabAddress.slice(0, 16), inline: true },
+        { name: "Error", value: err.message.slice(0, 200), inline: false },
+      ]).catch(() => {});
+    }
+  }
+
+  /**
    * Scan a single market for undercollateralized accounts.
    *
    * DESYNC-3/4 FIX: v17 market accounts have different magic bytes (PERCV16\0)
@@ -452,7 +488,17 @@ export class LiquidationService {
       if (isV17Account(data)) {
         // Resolve price from the v17 config (markEwmaE6 acts as lastEffectivePriceE6)
         const price = market.config.lastEffectivePriceE6 ?? market.config.authorityPriceE6 ?? 0n;
-        const v17Params = parseV17RiskParams(data);
+        let v17Params: ReturnType<typeof parseV17RiskParams>;
+        try {
+          v17Params = parseV17RiskParams(data);
+        } catch (err) {
+          if (err instanceof V17RiskParamsCorruptedError) {
+            this._alertCorruptedRiskParams(slabAddress, err);
+            return []; // fail closed for this scan; the alert is the signal to investigate
+          }
+          throw err;
+        }
+        this._corruptedRiskParamsAlertedAt.delete(slabAddress); // recovered — re-arm the latch
         const maintenanceMarginBps = v17Params.maintenanceMarginBps;
         const connection = getConnection();
         const v17Candidates = await scanV17Portfolios(
@@ -489,6 +535,20 @@ export class LiquidationService {
 
       const candidates: LiquidationCandidate[] = [];
       const maintenanceMarginBps = params.maintenanceMarginBps;
+      // H-8: parseParams() (SDK, vendored — cannot be edited here) reads this
+      // field with the same unvalidated raw-u64 pattern parseV17RiskParams used
+      // to have, and it gates the identical `marginRatioBps < maintenanceMarginBps`
+      // decision below — a 0n (or >=100%) here is exactly as dangerous on the
+      // v12.x path. The guard lives at this call site since the parser itself
+      // is out of scope.
+      if (maintenanceMarginBps <= 0n || maintenanceMarginBps >= BPS_MULTIPLIER) {
+        this._alertCorruptedRiskParams(
+          slabAddress,
+          new Error(`v12.x maintenanceMarginBps=${maintenanceMarginBps} is out of the valid (0, 10000) bps range`),
+        );
+        return [];
+      }
+      this._corruptedRiskParamsAlertedAt.delete(slabAddress);
 
       // H3: Use cluster clock for admin-oracle staleness to avoid false positives
       // from keeper host clock drift.
@@ -563,7 +623,9 @@ export class LiquidationService {
           // The equity<=0n short-circuit lives inside computeMarginRatioBps;
           // a candidate with marginRatioBps == 0n is collected here just like
           // any other below-threshold ratio.
-          if (marginRatioBps < maintenanceMarginBps) {
+          // H-8 defense-in-depth: equity<=0n is unconditionally liquidatable,
+          // independent of maintenanceMarginBps (see the validation above).
+          if (equity <= 0n || marginRatioBps < maintenanceMarginBps) {
             candidates.push({
               slabAddress,
               accountIdx: i,
@@ -801,7 +863,24 @@ export class LiquidationService {
           // equity as the scanner (#230). scanPriceE6 is the scan-time price; if it's
           // unavailable (0) we keep the leg-active check + rely on the on-chain program.
           const freshMarketData = await fetchSlabWithRetry(slabAddress);
-          const reMmBps = parseV17RiskParams(freshMarketData).maintenanceMarginBps;
+          // H-8: isolate this call from the outer "proceed cautiously" catch --
+          // that catch's fail-open posture is meant for transient RPC failures
+          // preventing re-verification entirely, not for "we got data back but
+          // it's corrupted." A corrupted reMmBps must not skip the recheck below
+          // (which would fall through to submitting the liquidation
+          // unconditionally) -- degrade to relying on the equity<=0n signal
+          // alone instead.
+          let reMmBps: bigint | null = null;
+          try {
+            reMmBps = parseV17RiskParams(freshMarketData).maintenanceMarginBps;
+            this._corruptedRiskParamsAlertedAt.delete(slabAddress.toBase58());
+          } catch (err) {
+            if (err instanceof V17RiskParamsCorruptedError) {
+              this._alertCorruptedRiskParams(slabAddress.toBase58(), err);
+            } else {
+              throw err;
+            }
+          }
           const freshNowSec = await fetchClusterUnixTimeSec(connection);
           const freshPrice = resolveV17WrapperPrice(parseWrapperConfigV17(freshMarketData), freshNowSec);
           if (freshPrice === 0n) {
@@ -828,7 +907,13 @@ export class LiquidationService {
               return null;
             }
           }
-          if (reMmBps > 0n) {
+          // H-8: always run the recheck, even when reMmBps could not be
+          // obtained (corrupted/null) -- equity<=0n is checked unconditionally
+          // so an outright-bankrupt position is never masked by an untrusted
+          // threshold. If reMmBps is null AND equity>0n for every leg, we have
+          // no reliable signal either way -- stillLiquidatable stays false and
+          // the function safely aborts (fails closed) rather than guessing.
+          {
             const feeDebt = pf.feeCredits < 0n ? -pf.feeCredits : 0n;
             const equity = pf.capital + pf.pnl - feeDebt;
             let stillLiquidatable = false;
@@ -837,7 +922,7 @@ export class LiquidationService {
               const absPos = leg.basisPosQ < 0n ? -leg.basisPosQ : leg.basisPosQ;
               const notional = absPos * freshPrice / PRICE_E6_DIVISOR;
               if (notional === 0n) continue;
-              if (computeMarginRatioBps(equity, notional) < reMmBps) {
+              if (equity <= 0n || (reMmBps !== null && computeMarginRatioBps(equity, notional) < reMmBps)) {
                 stillLiquidatable = true;
                 break;
               }

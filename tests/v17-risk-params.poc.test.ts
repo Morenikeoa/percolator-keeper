@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { parseV17RiskParams, V17_RISK_PARAMS_MIN_DATA_LEN } from "../src/lib/v17-risk.js";
+import {
+  parseV17RiskParams,
+  V17_RISK_PARAMS_MIN_DATA_LEN,
+  V17RiskParamsCorruptedError,
+} from "../src/lib/v17-risk.js";
 
 const V17_HEADER_LEN = 16;
 const V17_WRAPPER_CONFIG_LEN = 432;
@@ -41,5 +45,42 @@ describe("PoC: v17 risk params are parsed from the market-group header", () => {
     expect(params.hMax).toBe(86_400n);
     expect(params.maintenanceFeePerSlot).toBe(7n);
     expect(params.liquidationFeeShareBps).toBe(75n);
+  });
+
+  // H-8: a zero (or implausibly large) maintenanceMarginBps makes the
+  // liquidation-candidacy comparison `marginRatioBps < maintenanceMarginBps`
+  // unsatisfiable (0n<0n is always false) or trivially satisfied for every
+  // position (>=10000n), silently. Neither is a real on-chain config --
+  // reject both at parse time.
+  describe("H-8: maintenanceMarginBps sanity validation", () => {
+    function buildData(maintenanceMarginBps: bigint): Uint8Array {
+      const data = new Uint8Array(V17_RISK_PARAMS_MIN_DATA_LEN);
+      writeU128LE(data, V17_HEADER_LEN + 96, 7n);
+      writeU64LE(data, V17_ENGINE_CONFIG_OFF + 38, 100n);
+      writeU64LE(data, V17_ENGINE_CONFIG_OFF + 46, 86_400n);
+      writeU64LE(data, V17_ENGINE_CONFIG_OFF + 54, maintenanceMarginBps);
+      writeU64LE(data, V17_ENGINE_CONFIG_OFF + 78, 75n);
+      return data;
+    }
+
+    it("throws V17RiskParamsCorruptedError when maintenanceMarginBps decodes to 0", () => {
+      expect(() => parseV17RiskParams(buildData(0n))).toThrow(V17RiskParamsCorruptedError);
+      expect(() => parseV17RiskParams(buildData(0n))).toThrow(/maintenanceMarginBps=0/);
+    });
+
+    it("throws when maintenanceMarginBps decodes to >= 10_000 (>= 100% margin)", () => {
+      expect(() => parseV17RiskParams(buildData(10_000n))).toThrow(V17RiskParamsCorruptedError);
+    });
+
+    it("throws when maintenanceMarginBps decodes to an implausibly huge corrupted value", () => {
+      expect(() => parseV17RiskParams(buildData(18_446_744_073_709_551_615n))).toThrow(
+        V17RiskParamsCorruptedError,
+      );
+    });
+
+    it("accepts the boundary values 1 and 9999 bps", () => {
+      expect(parseV17RiskParams(buildData(1n)).maintenanceMarginBps).toBe(1n);
+      expect(parseV17RiskParams(buildData(9_999n)).maintenanceMarginBps).toBe(9_999n);
+    });
   });
 });

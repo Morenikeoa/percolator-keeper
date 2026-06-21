@@ -568,4 +568,78 @@ describe("RpcPool — metric recording", () => {
       expect.objectContaining({ provider: "helius", method: "getSlot", result: "fail" }),
     );
   });
+
+  // M-3: classification must come from the error itself, not just elapsed
+  // latency -- a fast-failing non-timeout error past unhealthyP99Ms and a
+  // genuine timeout error resolving quickly were both previously mislabeled.
+  describe("M-3: timeout classification by error type, not latency alone", () => {
+    it("labels an AbortError as 'timeout' even though it resolved fast (latency below unhealthyP99Ms)", async () => {
+      const metrics = await import("../../src/lib/metrics.js");
+      const abortErr = new Error("The operation was aborted");
+      abortErr.name = "AbortError";
+      const failConn = makeConn({
+        getSlot: vi.fn(async () => { throw abortErr; }),
+      });
+      const pool = new RpcPool(failConn as any, makeConn() as any, {
+        config: makeConfig({ forceAlchemyGpa: false }),
+        now: mockNow, // latency stays 0 -- below unhealthyP99Ms
+      });
+      vi.clearAllMocks();
+      await expect(pool.getSlot()).rejects.toThrow();
+      expect(metrics.rpcRequestTotal.inc).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: "helius", method: "getSlot", result: "timeout" }),
+      );
+    });
+
+    it("labels a message containing 'timed out' as 'timeout' even with zero latency", async () => {
+      const metrics = await import("../../src/lib/metrics.js");
+      const failConn = makeConn({
+        getSlot: vi.fn(async () => { throw new Error("fetchSlab: timed out after 15000ms"); }),
+      });
+      const pool = new RpcPool(failConn as any, makeConn() as any, {
+        config: makeConfig({ forceAlchemyGpa: false }),
+        now: mockNow,
+      });
+      vi.clearAllMocks();
+      await expect(pool.getSlot()).rejects.toThrow();
+      expect(metrics.rpcRequestTotal.inc).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: "helius", method: "getSlot", result: "timeout" }),
+      );
+    });
+
+    it("labels a fast-failing generic error (e.g. a 400) as 'fail', not 'timeout', regardless of latency heuristic", async () => {
+      const metrics = await import("../../src/lib/metrics.js");
+      const failConn = makeConn({
+        getSlot: vi.fn(async () => { throw new Error("400 Bad Request"); }),
+      });
+      const pool = new RpcPool(failConn as any, makeConn() as any, {
+        config: makeConfig({ forceAlchemyGpa: false }),
+        now: mockNow,
+      });
+      vi.clearAllMocks();
+      await expect(pool.getSlot()).rejects.toThrow();
+      expect(metrics.rpcRequestTotal.inc).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: "helius", method: "getSlot", result: "fail" }),
+      );
+    });
+
+    it("still falls back to the latency heuristic for a generic error with no timeout signal that exceeded unhealthyP99Ms", async () => {
+      const metrics = await import("../../src/lib/metrics.js");
+      const failConn = makeConn({
+        getSlot: vi.fn(async () => {
+          t += 3_000; // advance past unhealthyP99Ms (2_000 default) before throwing
+          throw new Error("connection reset");
+        }),
+      });
+      const pool = new RpcPool(failConn as any, makeConn() as any, {
+        config: makeConfig({ forceAlchemyGpa: false }),
+        now: mockNow,
+      });
+      vi.clearAllMocks();
+      await expect(pool.getSlot()).rejects.toThrow();
+      expect(metrics.rpcRequestTotal.inc).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: "helius", method: "getSlot", result: "timeout" }),
+      );
+    });
+  });
 });

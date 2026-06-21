@@ -84,3 +84,29 @@ describe("PoC: v17 risk params are parsed from the market-group header", () => {
     });
   });
 });
+
+describe("M-8: warmupPeriodSlots/openInterestCap/adlFillCapBps/minPositionSize are documented stubs, not parsed values", () => {
+  it("stay 0n regardless of surrounding non-zero data — they have no on-chain byte offset to read", () => {
+    // Fill the whole buffer with non-zero bytes, including the real parsed
+    // fields (overwritten with known values below) and everywhere else.
+    // If any of the 4 stub fields were silently reading from some byte
+    // range, this would surface it as a non-zero result.
+    const data = new Uint8Array(V17_RISK_PARAMS_MIN_DATA_LEN).fill(0xff);
+
+    writeU128LE(data, V17_HEADER_LEN + 96, 7n);
+    writeU64LE(data, V17_ENGINE_CONFIG_OFF + 38, 100n);
+    writeU64LE(data, V17_ENGINE_CONFIG_OFF + 46, 86_400n);
+    writeU64LE(data, V17_ENGINE_CONFIG_OFF + 54, 1_000n);
+    writeU64LE(data, V17_ENGINE_CONFIG_OFF + 78, 75n);
+
+    const params = parseV17RiskParams(data);
+
+    expect(params.warmupPeriodSlots).toBe(0n);
+    expect(params.openInterestCap).toBe(0n);
+    expect(params.adlFillCapBps).toBe(0n);
+    expect(params.minPositionSize).toBe(0n);
+    // Sanity check: the real fields DO pick up the non-zero fill, proving
+    // the buffer construction above isn't accidentally all-zero.
+    expect(params.maintenanceMarginBps).toBe(1_000n);
+  });
+});

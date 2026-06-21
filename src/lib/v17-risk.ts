@@ -58,6 +58,17 @@ export class V17RiskParamsCorruptedError extends Error {
   }
 }
 
+/**
+ * M-8: four fields below are hardcoded to 0n, not parsed from on-chain bytes.
+ * Verified against percolator-prog's v16_program.rs (the v16/v17 engine
+ * config struct) and percolator-sdk — neither defines openInterestCap,
+ * adlFillCapBps, or minPositionSize anywhere; there is no on-chain byte
+ * layout for them to parse. warmupPeriodSlots is a real field, but only on
+ * pre-v12.15 slabs — v12.15+ (including every v17 market) replaced it with
+ * hMin/hMax, which ARE parsed below. A caller must not treat any of these
+ * four 0n values as a meaningful on-chain reading (e.g. "no cap"); they are
+ * placeholders kept for return-type shape compatibility only.
+ */
 export function parseV17RiskParams(data: Uint8Array): {
   warmupPeriodSlots: bigint;
   maintenanceMarginBps: bigint;
@@ -84,17 +95,17 @@ export function parseV17RiskParams(data: Uint8Array): {
   }
 
   return {
-    warmupPeriodSlots: 0n,
+    warmupPeriodSlots: 0n, // not present on v17 slabs — see function doc comment
     maintenanceMarginBps,
     hMin: readU64LE(data, V17_ENGINE_CONFIG_OFF + V17_ENGINE_CONFIG_H_MIN_OFF),
     hMax: readU64LE(data, V17_ENGINE_CONFIG_OFF + V17_ENGINE_CONFIG_H_MAX_OFF),
-    openInterestCap: 0n,
+    openInterestCap: 0n, // no on-chain field exists — see function doc comment
     maintenanceFeePerSlot: readU128LE(data, V17_WRAPPER_MAINTENANCE_FEE_PER_SLOT_OFF),
     liquidationFeeShareBps: readU64LE(
       data,
       V17_ENGINE_CONFIG_OFF + V17_ENGINE_CONFIG_LIQUIDATION_FEE_BPS_OFF,
     ),
-    adlFillCapBps: 0n,
-    minPositionSize: 0n,
+    adlFillCapBps: 0n, // no on-chain field exists — see function doc comment
+    minPositionSize: 0n, // no on-chain field exists — see function doc comment
   };
 }

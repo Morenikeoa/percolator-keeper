@@ -54,18 +54,19 @@ export interface TxLaneStats {
   failed: number;
 }
 
-function parseEnvInt(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (raw === undefined) return fallback;
-  const n = parseInt(raw, 10);
-  return isNaN(n) ? fallback : n;
+function parseEnvInt(name: string, fallback: number, min = 1): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= min ? n : fallback;
 }
 
 function buildLaneConfig(lane: TxLane, defaults: { concurrency: number; intervalCap: number; interval: number }) {
   return {
-    concurrency: parseEnvInt(`TX_QUEUE_${lane.toUpperCase()}_CONCURRENCY`, defaults.concurrency),
-    intervalCap: parseEnvInt(`TX_QUEUE_${lane.toUpperCase()}_INTERVAL_CAP`, defaults.intervalCap),
-    interval: parseEnvInt(`TX_QUEUE_${lane.toUpperCase()}_INTERVAL_MS`, defaults.interval),
+    concurrency: parseEnvInt(`TX_QUEUE_${lane.toUpperCase()}_CONCURRENCY`, defaults.concurrency, 1),
+    intervalCap: parseEnvInt(`TX_QUEUE_${lane.toUpperCase()}_INTERVAL_CAP`, defaults.intervalCap, 1),
+    interval: parseEnvInt(`TX_QUEUE_${lane.toUpperCase()}_INTERVAL_MS`, defaults.interval, 0),
   };
 }
 
@@ -77,19 +78,19 @@ export class TxQueue {
 
   constructor(config: TxQueueConfig = {}) {
     const liqCfg = {
-      concurrency: config.liquidation?.concurrency ?? parseEnvInt("TX_QUEUE_LIQUIDATION_CONCURRENCY", 10),
-      intervalCap: config.liquidation?.intervalCap ?? parseEnvInt("TX_QUEUE_LIQUIDATION_INTERVAL_CAP", 30),
-      interval: config.liquidation?.interval ?? parseEnvInt("TX_QUEUE_LIQUIDATION_INTERVAL_MS", 1000),
+      concurrency: config.liquidation?.concurrency ?? parseEnvInt("TX_QUEUE_LIQUIDATION_CONCURRENCY", 10, 1),
+      intervalCap: config.liquidation?.intervalCap ?? parseEnvInt("TX_QUEUE_LIQUIDATION_INTERVAL_CAP", 30, 1),
+      interval: config.liquidation?.interval ?? parseEnvInt("TX_QUEUE_LIQUIDATION_INTERVAL_MS", 1000, 0),
     };
     const oracleCfg = {
-      concurrency: config.oracle?.concurrency ?? parseEnvInt("TX_QUEUE_ORACLE_CONCURRENCY", 5),
-      intervalCap: config.oracle?.intervalCap ?? parseEnvInt("TX_QUEUE_ORACLE_INTERVAL_CAP", 15),
-      interval: config.oracle?.interval ?? parseEnvInt("TX_QUEUE_ORACLE_INTERVAL_MS", 1000),
+      concurrency: config.oracle?.concurrency ?? parseEnvInt("TX_QUEUE_ORACLE_CONCURRENCY", 5, 1),
+      intervalCap: config.oracle?.intervalCap ?? parseEnvInt("TX_QUEUE_ORACLE_INTERVAL_CAP", 15, 1),
+      interval: config.oracle?.interval ?? parseEnvInt("TX_QUEUE_ORACLE_INTERVAL_MS", 1000, 0),
     };
     const crankCfg = {
-      concurrency: config.crank?.concurrency ?? parseEnvInt("TX_QUEUE_CRANK_CONCURRENCY", 5),
-      intervalCap: config.crank?.intervalCap ?? parseEnvInt("TX_QUEUE_CRANK_INTERVAL_CAP", 10),
-      interval: config.crank?.interval ?? parseEnvInt("TX_QUEUE_CRANK_INTERVAL_MS", 1000),
+      concurrency: config.crank?.concurrency ?? parseEnvInt("TX_QUEUE_CRANK_CONCURRENCY", 5, 1),
+      intervalCap: config.crank?.intervalCap ?? parseEnvInt("TX_QUEUE_CRANK_INTERVAL_CAP", 10, 1),
+      interval: config.crank?.interval ?? parseEnvInt("TX_QUEUE_CRANK_INTERVAL_MS", 1000, 0),
     };
 
     this._lanes = {

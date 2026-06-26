@@ -1466,4 +1466,120 @@ describe('LiquidationService', () => {
       expect(await firstCall).toBe('sig-first');
     });
   });
+
+  // BUG-103: a position whose liquidate() keeps failing must not be retried
+  // at full tx-fee cost on every single cycle/event forever -- that is an
+  // unbounded, asymmetric-cost DoS surface (a cheap owner-side action timed
+  // against the keeper's scan/submit window beats the recheck every time).
+  describe('BUG-103: per-position failure backoff', () => {
+    function makeMarketAt(slabAddr: string) {
+      return {
+        slabAddress: { toBase58: () => slabAddr, equals: () => false },
+        programId: { toBase58: () => 'ProgramId1111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'Mint111111111111111111111111111111111111' },
+          oracleAuthority: mockZeroKey(),
+          indexFeedId: mockNonZeroKey('feed'),
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'Admin111111111111111111111111111111111' } },
+      };
+    }
+
+    function makeCandidate(slabAddress: string, accountIdx: number, owner: string) {
+      return {
+        slabAddress,
+        accountIdx,
+        owner,
+        positionSize: 1_000n,
+        capital: 100n,
+        pnl: -50n,
+        marginRatio: 4.0,
+        maintenanceMarginBps: 500n,
+      };
+    }
+
+    // gatedLiquidate's _cycleSeenPositions/_cycleOwnerCounts are normally
+    // cleared per-cycle by scanAndLiquidateAll; calling gatedLiquidate
+    // directly back-to-back (as the H-1 suite above also does) requires
+    // clearing them manually to simulate the next cycle's boundary.
+    function clearCycleState(svc: any): void {
+      svc._cycleSeenPositions.clear();
+      svc._cycleOwnerCounts.clear();
+    }
+
+    it('allows an immediate retry after exactly one failure (first failure is free)', async () => {
+      const svc = new LiquidationService(mockOracleService as any);
+      const owner = 'OwnerBackoff1111111111111111111111111111111';
+      const slab = 'SlabBackoff111111111111111111111111111111111';
+      const market = makeMarketAt(slab);
+      const candidate = makeCandidate(slab, 1, owner);
+
+      const liquidateSpy = vi
+        .spyOn(svc, 'liquidate')
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce('sig-ok');
+
+      const first = await (svc as any).gatedLiquidate(market, candidate);
+      expect(first).toBeNull();
+      clearCycleState(svc);
+      const second = await (svc as any).gatedLiquidate(market, candidate);
+      expect(second).toBe('sig-ok');
+      expect(liquidateSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it('throttles a position after repeated consecutive failures instead of retrying every call', async () => {
+      const svc = new LiquidationService(mockOracleService as any);
+      const owner = 'OwnerGrief111111111111111111111111111111111';
+      const slab = 'SlabGrief1111111111111111111111111111111111';
+      const market = makeMarketAt(slab);
+      const candidate = makeCandidate(slab, 1, owner);
+
+      const liquidateSpy = vi.spyOn(svc, 'liquidate').mockResolvedValue(null);
+
+      // Failure 1: free retry (matches existing single-abort semantics).
+      expect(await (svc as any).gatedLiquidate(market, candidate)).toBeNull();
+      clearCycleState(svc);
+      // Failure 2: now backed off -- a third immediate call must NOT re-invoke
+      // liquidate() again before the cooldown elapses.
+      expect(await (svc as any).gatedLiquidate(market, candidate)).toBeNull();
+      expect(liquidateSpy).toHaveBeenCalledTimes(2);
+      clearCycleState(svc);
+
+      const third = await (svc as any).gatedLiquidate(market, candidate);
+      expect(third).toBeNull();
+      // Still only 2 -- the third call was skipped by the backoff, not a new
+      // (failed) liquidate() attempt.
+      expect(liquidateSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it('clears the backoff on a successful liquidation', async () => {
+      const svc = new LiquidationService(mockOracleService as any);
+      const owner = 'OwnerRecover111111111111111111111111111111';
+      const slab = 'SlabRecover11111111111111111111111111111111';
+      const market = makeMarketAt(slab);
+      const candidate = makeCandidate(slab, 1, owner);
+
+      const liquidateSpy = vi
+        .spyOn(svc, 'liquidate')
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce('sig-final');
+
+      expect(await (svc as any).gatedLiquidate(market, candidate)).toBeNull(); // failure 1 (free)
+      clearCycleState(svc);
+      expect(await (svc as any).gatedLiquidate(market, candidate)).toBeNull(); // failure 2 (backed off after this)
+      clearCycleState(svc);
+
+      // Manually expire the backoff window to simulate time passing, then land.
+      const positionKey = `${slab}:v12:1`;
+      const entry = (svc as any)._positionBackoff.get(positionKey);
+      expect(entry).toBeDefined();
+      entry.retryAfter = Date.now() - 1;
+
+      expect(await (svc as any).gatedLiquidate(market, candidate)).toBe('sig-final');
+      expect(liquidateSpy).toHaveBeenCalledTimes(3);
+      expect((svc as any)._positionBackoff.has(positionKey)).toBe(false);
+    });
+  });
 });

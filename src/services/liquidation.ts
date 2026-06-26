@@ -650,6 +650,18 @@ export class LiquidationService {
   // gatedLiquidate is the sole entry point for both the polling path and the
   // LaserStream event path, so guarding here covers both unconditionally.
   private readonly _inFlightPositions = new Set<string>();
+  // BUG-103: per-position failure backoff. _cycleSeenPositions/_inFlightPositions
+  // only prevent *concurrent* double-submission within or across one cycle --
+  // neither remembers that a liquidate() attempt for a given position failed,
+  // so a position whose liquidate() keeps failing (e.g. an owner racing a cheap
+  // top-up between the keeper's scan and submit to flip stillLiquidatable just
+  // before send) gets re-attempted at full tx-fee cost on every single polling
+  // cycle, forever, with zero increasing cost to the owner. Cleared on a
+  // successful liquidation; capped so a position already known to be
+  // liquidatable is never throttled past POSITION_BACKOFF_MAX_MS.
+  private readonly _positionBackoff = new Map<string, { failures: number; retryAfter: number }>();
+  private static readonly POSITION_BACKOFF_BASE_MS = 5_000;
+  private static readonly POSITION_BACKOFF_MAX_MS = 300_000; // 5 min, matches maxBackoffMs
   // B5: collapse per-liquidation Discord alerts into a single summary alert per
   // market within a 5 s window — prevents cascade-driven channel flooding.
   private readonly _liquidationAlertAggregator = new AlertAggregator(
@@ -963,6 +975,18 @@ export class LiquidationService {
       });
       return null;
     }
+    // BUG-103: a position that keeps failing gets an escalating cooldown
+    // instead of an unconditional retry on every cycle/event.
+    const backoff = this._positionBackoff.get(positionKey);
+    if (backoff && Date.now() < backoff.retryAfter) {
+      logger.debug("Skipping position in per-position failure backoff", {
+        positionKey,
+        owner: candidate.owner.slice(0, 8),
+        failures: backoff.failures,
+        retryInMs: backoff.retryAfter - Date.now(),
+      });
+      return null;
+    }
     if (this._cycleSeenPositions.has(positionKey)) {
       logger.debug("Skipping position already targeted this cycle", {
         positionKey,
@@ -982,13 +1006,35 @@ export class LiquidationService {
     this._cycleOwnerCounts.set(candidate.owner, ownerCount + 1);
     this._inFlightPositions.add(positionKey);
     try {
-      return (await this.liquidate(
-        market,
-        candidate.accountIdx,
-        candidate.v17PortfolioPubkey,
-        candidate.scanPriceE6,
-        candidate.closeQ ?? 0n,
-      )) ?? null;
+      const sig =
+        (await this.liquidate(
+          market,
+          candidate.accountIdx,
+          candidate.v17PortfolioPubkey,
+          candidate.scanPriceE6,
+          candidate.closeQ ?? 0n,
+        )) ?? null;
+      if (sig) {
+        // BUG-103: a landed liquidation clears any prior failure history --
+        // the position is gone, and a future reuse of this key (a new
+        // position at the same slot) deserves a clean slate.
+        this._positionBackoff.delete(positionKey);
+      } else {
+        const prev = this._positionBackoff.get(positionKey);
+        const failures = (prev?.failures ?? 0) + 1;
+        // The first failure is free (immediate retry permitted) -- a single
+        // recheck-abort (oracle moved, owner topped up once) is routine and
+        // must not delay a position that's still genuinely liquidatable.
+        // Backoff only escalates once a position has failed repeatedly.
+        const delay = failures <= 1
+          ? 0
+          : Math.min(
+              LiquidationService.POSITION_BACKOFF_BASE_MS * Math.pow(2, failures - 2),
+              LiquidationService.POSITION_BACKOFF_MAX_MS,
+            );
+        this._positionBackoff.set(positionKey, { failures, retryAfter: Date.now() + delay });
+      }
+      return sig;
     } finally {
       // Always release, regardless of success, a returned null (race-
       // condition abort inside liquidate()), or an unexpected thrown error.

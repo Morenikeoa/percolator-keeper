@@ -11,6 +11,13 @@ export interface HealthStatusInput {
   liqScanRunning: boolean;
   /** Milliseconds since the liquidation scanner's last scan, or Infinity if it has never scanned. */
   timeSinceLiqScan: number;
+  /**
+   * BUG-109: number of markets oracleService.getStaleMarkets() currently
+   * reports as stale-paused (external DexScreener/Jupiter fetch hasn't
+   * succeeded recently for that market). Optional/defaults to 0 so existing
+   * callers/tests that don't pass it are unaffected.
+   */
+  stalePausedMarketCount?: number;
 }
 
 /**
@@ -32,7 +39,15 @@ export interface HealthStatusInput {
 export function computeHealthStatus(
   input: HealthStatusInput,
 ): "ok" | "degraded" | "down" | "starting" {
-  const { uptimeMs, mostRecentCrank, marketsTracked, timeSinceLastCrank, liqScanRunning, timeSinceLiqScan } = input;
+  const {
+    uptimeMs,
+    mostRecentCrank,
+    marketsTracked,
+    timeSinceLastCrank,
+    liqScanRunning,
+    timeSinceLiqScan,
+    stalePausedMarketCount = 0,
+  } = input;
 
   // Grace period: allow 5 minutes after startup before marking as "down".
   if (uptimeMs < 300_000 && mostRecentCrank === 0) {
@@ -58,6 +73,21 @@ export function computeHealthStatus(
       status = "down"; // Liquidation scan stalled >5 min
     } else if (timeSinceLiqScan > 120_000 && status === "ok") {
       status = "degraded"; // Liquidation scan stalled >2 min
+    }
+  }
+
+  // BUG-109: an external oracle outage (DexScreener + Jupiter both down)
+  // already pauses affected HYPERP markets via stalePausedMarkets (visible
+  // on /pause-status), but that signal previously never reached /health's
+  // top-level status -- an operator alerting only on /health would see "ok"
+  // through a real, ongoing oracle outage. Every tracked market stale-paused
+  // is treated as severely as a stalled crank/scan loop; a partial outage
+  // only degrades (never de-escalates an already-"down" status).
+  if (stalePausedMarketCount > 0) {
+    if (marketsTracked > 0 && stalePausedMarketCount >= marketsTracked && status !== "down") {
+      status = "down";
+    } else if (status === "ok") {
+      status = "degraded";
     }
   }
 

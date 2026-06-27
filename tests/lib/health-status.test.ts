@@ -81,4 +81,58 @@ describe("computeHealthStatus", () => {
     });
     expect(status).toBe("ok");
   });
+
+  // BUG-109: an oracle outage already pauses affected markets (visible on
+  // /pause-status via stalePausedMarkets), but that signal never reached
+  // /health's top-level status before this fix.
+  describe("BUG-109: oracle staleness gates status", () => {
+    it("is unaffected when stalePausedMarketCount is omitted (default 0)", () => {
+      expect(computeHealthStatus(base())).toBe("ok");
+    });
+
+    it("is unaffected when stalePausedMarketCount is explicitly 0", () => {
+      const status = computeHealthStatus({ ...base(), stalePausedMarketCount: 0 });
+      expect(status).toBe("ok");
+    });
+
+    it("downgrades 'ok' to 'degraded' when some (but not all) tracked markets are stale-paused", () => {
+      const status = computeHealthStatus({
+        ...base(),
+        marketsTracked: 5,
+        stalePausedMarketCount: 2,
+      });
+      expect(status).toBe("degraded");
+    });
+
+    it("escalates to 'down' when every tracked market is stale-paused", () => {
+      const status = computeHealthStatus({
+        ...base(),
+        marketsTracked: 3,
+        stalePausedMarketCount: 3,
+      });
+      expect(status).toBe("down");
+    });
+
+    it("does not de-escalate an already-'down' status from a partial oracle outage", () => {
+      const status = computeHealthStatus({
+        ...base(),
+        timeSinceLastCrank: 400_000, // already "down" on crank staleness alone
+        marketsTracked: 5,
+        stalePausedMarketCount: 1,
+      });
+      expect(status).toBe("down");
+    });
+
+    it("does not escalate to 'down' from a total oracle outage when marketsTracked is 0", () => {
+      // stalePausedMarketCount can't legitimately exceed marketsTracked, but
+      // marketsTracked===0 must keep short-circuiting to "ok" regardless.
+      const status = computeHealthStatus({
+        ...base(),
+        marketsTracked: 0,
+        timeSinceLastCrank: Infinity,
+        stalePausedMarketCount: 0,
+      });
+      expect(status).toBe("ok");
+    });
+  });
 });

@@ -614,6 +614,9 @@ res.writeHead(401, secureJsonHeaders);
       timeSinceLastCrank,
       liqScanRunning: liqScanStatus.running,
       timeSinceLiqScan: liqScanStatus.lastScanTime > 0 ? now - liqScanStatus.lastScanTime : Infinity,
+      // BUG-109: surface the same oracle-staleness signal /pause-status already
+      // reports (stalePausedMarkets) into the top-level health status.
+      stalePausedMarketCount: stalePausedMarkets.size,
     });
     
     // ADL removed in v17 — always disabled.
